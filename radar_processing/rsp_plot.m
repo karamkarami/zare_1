@@ -9,11 +9,14 @@ function rsp_plot(out, video, varargin)
 %   Options
 %     'frame'    []      row of the integral / CFAR lanes for the range cut
 %                        ([] = row with the most detections)
-%     'bin'      []      Doppler bin for the range cut ([] = strongest detection)
+%     'bin'      []      Doppler bin of the integral panel and the range cut
+%                        ([] = bin of the strongest detection)
+%     'bins'     []      bins of the output panel (max after CFAR);
+%                        [] = as processed (P.output.bins)
 %     'range'    []      range cells shown, [first last] ([] = all)
 %     'colormap' 'jet'
 
-opt = struct('frame', [], 'bin', [], 'range', [], 'colormap', 'jet');
+opt = struct('frame', [], 'bin', [], 'bins', [], 'range', [], 'colormap', 'jet');
 for i = 1:2:numel(varargin)
     opt.(varargin{i}) = varargin{i+1};
 end
@@ -49,18 +52,26 @@ image2(panel + 1, toDb(out.decoder(:, rc)), rc, sprintf('matched filter, switch 
        out.mf.switchCell));
 image2(panel + 2, toDb(out.canceler(:, rc)), rc, sprintf('%d-pulse canceler', ...
        numel(rsp_canceler_taps(out.P.canceler))));
-image2(panel + 3, max(pwDb(out.integral(:, rc, :)), [], 3), rc, ...
-       sprintf('integral n=%d, max bin', out.P.nci.nFrames));
+image2(panel + 3, pwDb(out.integral(:, rc, opt.bin)), rc, ...
+       sprintf('integral n=%d, bin %d', out.P.nci.nFrames, opt.bin));
 
-% CFAR detections: range x row, coloured by Doppler bin
+% output stage: max over the selected bins after the CFAR
+if isempty(opt.bins)
+    val = out.max.value;
+    bt  = 'all';
+    if ~isempty(out.P.output.bins), bt = mat2str(out.P.output.bins); end
+else
+    val = rsp_cfar_max(out.cfar.map, opt.bins);
+    bt  = mat2str(opt.bins);
+end
 subplot(2, 3, panel + 4);
-L  = out.cfar.list;
-in = L.range >= rc(1) & L.range <= rc(end);
-scatter(L.range(in), L.frame(in), 6, L.bin(in), 'filled');
-axis([rc(1) rc(end) 0.5 size(det, 1) + 0.5]);
-cb = colorbar; ylabel(cb, 'Doppler bin');
-xlabel('range cell'); ylabel('frame');
-title(sprintf('%s-CFAR: %d detections', upper(out.P.cfar.type), numel(L.range)));
+[fr, cc] = find(val(:, rc) > 0);
+lvl = pwDb(val(sub2ind(size(val), fr, cc + rc(1) - 1)));
+scatter(cc + rc(1) - 1, fr, 8, lvl, 'filled');
+axis([rc(1) rc(end) 0.5 size(val, 1) + 0.5]);
+box on; cb = colorbar; ylabel(cb, 'dB');
+xlabel('range cell'); ylabel('row');
+title(sprintf('%s-CFAR + max, bins %s: %d', upper(out.P.cfar.type), bt, nnz(val(:, rc) > 0)));
 
 % range cut: integrated signal against the CFAR threshold
 subplot(2, 3, panel + 5);
@@ -71,6 +82,11 @@ plot(rc, pwDb(x), 'Color', [0.2 0.4 0.8]); hold on
 plot(rc, pwDb(t), 'r', 'LineWidth', 1);
 plot(rc(h), pwDb(x(h)), 'ko', 'MarkerFaceColor', 'y');
 hold off; grid on; xlim([rc(1) rc(end)]);
+v = pwDb(x);  v = sort(v(isfinite(v)));
+if ~isempty(v)
+    tt = pwDb(t(isfinite(t)));
+    ylim([v(max(1, round(0.01*numel(v)))) - 5, max([v(end); tt(:)]) + 5]);
+end
 xlabel('range cell'); ylabel('dB');
 legend('integral', 'threshold', 'detection', 'Location', 'best');
 title(sprintf('frame %d (pulse %d), bin %d', opt.frame, ...
@@ -89,8 +105,14 @@ end
 function f = powerDb(law)
 % dB conversion matching the detector law of the integrator.
 switch lower(law)
-    case 'square', f = @(x) 10*log10(max(double(x), realmin));
-    case 'linear', f = @(x) 20*log10(max(double(x), realmin));
+    case 'square', f = @(x) 10*log10(nanZero(x));
+    case 'linear', f = @(x) 20*log10(nanZero(x));
     otherwise,     f = @(x) double(x);                % already in dB
 end
+end
+
+function x = nanZero(x)
+% Zero (no data / no detection) -> NaN, so it is left out of dB plots.
+x = double(x);
+x(x <= 0) = NaN;
 end

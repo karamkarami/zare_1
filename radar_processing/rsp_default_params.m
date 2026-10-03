@@ -1,125 +1,167 @@
 function P = rsp_default_params()
 %RSP_DEFAULT_PARAMS Default parameter set of the radar signal processing chain.
 %
-%   P = rsp_default_params() returns a struct holding every tunable value of
-%   the chain:
+%   P = rsp_default_params() returns a struct holding every tunable value:
 %
-%       video -> matched filter -> 3-pulse canceler -> Doppler FFT
-%             -> non-coherent integration -> SO-CFAR
+%       video -> decoder (matched / mismatched filter) -> 3-pulse canceler
+%             -> Doppler FFT -> non-coherent integration -> SO-CFAR
+%             -> max over Doppler bins -> plots / PPI
 %
-%   Edit the returned struct (or this file) to match your radar. All values
-%   below are only "reasonable" defaults used by the self-test.
+%   Edit the returned struct (or this file) to match your radar.
 %
-%   Data convention used everywhere in the chain:
+%   Data layout everywhere in the chain:
 %       2-D lanes : pulses x range            (rows = slow time, cols = fast time)
 %       3-D lanes : pulses x range x doppler  (same layout as the MCPS log)
-%
-%   Units: frequencies in MHz, times in microseconds (MHz * us = cycles).
+%   Units: MHz and microseconds inside the signal chain (MHz * us = cycles),
+%          metres, degrees, m/s and Hz for the radar geometry.
+
+%% ------------------------------------------------------------------ Radar
+P.radar.prfHz        = 1000;        % pulse repetition frequency [Hz]
+P.radar.rpm          = 6;           % antenna rotation [rev/min] (36 deg/s)
+P.radar.fcMHz        = 1300;        % carrier frequency [MHz] (L band, lambda = 0.23 m)
+P.radar.azStartDeg   = 0;           % antenna azimuth of pulse 1 [deg], 0 = north
+P.radar.rangeOffsetM = 0;           % range of cell 1 [m]
+
+%% ------------------------------------------------------------------ Antenna (azimuth only)
+P.antenna.beamwidthDeg = 4;         % 3 dB beamwidth [deg]
+P.antenna.sidelobeDb   = -25;       % first sidelobe, one way [dB]
+P.antenna.backlobeDb   = -40;       % back lobe, one way [dB]
+P.antenna.nullDepthDb  = -20;       % filling of the nulls between sidelobes [dB]
 
 %% ------------------------------------------------------------------ Sampling
-P.fs = 4;                       % complex baseband sampling frequency [MHz]
+P.fs = 6;                           % complex baseband sampling frequency [MHz]
+                                    % (6 samples per 1 us chip, 25 m range cells)
 
 %% ------------------------------------------------------------------ Pulses
-% One entry per transmitted pulse. The echo of a scatterer located at range
-% cell r appears in the video at samples  r + delay : r + delay + width - 1.
+% One entry per transmitted pulse. The echo of a scatterer in range cell r
+% (0-based) starts at sample r + delay of that pulse.
 %
-%   widthUs     pulse length [us]                    (p1, p2)
-%   bwMHz       LFM swept bandwidth [MHz]            (0 = unmodulated pulse)
-%   fcMHz       pulse centre frequency inside the baseband [MHz]
-%   slope       +1 up-chirp, -1 down-chirp
-%   delayUs     transmit start of this pulse, relative to range cell 0 [us]
-%   code        optional phase code (chip values, e.g. Barker [1 1 1 -1 1]);
-%               chips are spread uniformly over widthUs. [] = not used
-%   samples     optional user replica (complex column vector at fs).
-%               When not empty it overrides every field above except delayUs
-%   window      matched-filter amplitude weighting:
-%               'none' | 'hamming' | 'hann' | 'blackman' | 'blackmanharris'
-%               | 'kaiser' | 'taylor' | numeric vector | function handle @(N)
-%   windowParam window parameter: kaiser -> beta, taylor -> [nbar sllDb]
-%   gainDb      extra gain applied to this pulse's matched-filter output
+%   type         'code' (phase code) | 'lfm'
+%   bwMHz        bandwidth [MHz]: chip rate of a code (1 MHz -> 1 us chips),
+%                swept bandwidth of an LFM
+%   code         chip values of the code, any length, binary or polyphase
+%                (put your own coefficients here; rsp_code has common codes)
+%   codeRate     'chip' (one value per chip) | 'sample' (already sampled at fs)
+%   decoder      your decoder coefficients; [] = matched filter
+%   decoderForm  'fir'       : FIR taps applied by convolution
+%                              (matched filter = conj(fliplr(code)))
+%                'reference' : correlation reference (matched filter = code)
+%   decoderRate  'chip' | 'sample'
+%   decoderLag   [] = align on the main peak automatically, or lag in samples
+%   widthUs      LFM length [us] (a code's length is numel(code)/bwMHz)
+%   slope        LFM: +1 up-chirp, -1 down-chirp
+%   fcMHz        pulse centre frequency inside the baseband [MHz]
+%   delayUs      transmit start of this pulse relative to range cell 0 [us]
+%   window       weighting of the decoder ('none', 'hamming', 'taylor' ...)
+%   windowParam  kaiser -> beta, taylor -> [nbar sllDb]
+%   gainDb       extra gain of this pulse's decoder output
+%   samples      user transmit samples at fs (overrides type / code / LFM)
 
-% Pulse 1: short pulse (covers the blind zone of the long pulse)
-P.pulse(1).widthUs     = 2;         % p1
-P.pulse(1).bwMHz       = 0;
-P.pulse(1).fcMHz       = -1.2;
-P.pulse(1).slope       = +1;
-P.pulse(1).delayUs     = 20;        % transmitted right after the long pulse
-P.pulse(1).code        = [];
-P.pulse(1).samples     = [];
+% Pulse 1: short pulse, Barker 13 (13 us), covers the blind zone of pulse 2
+P.pulse(1).type        = 'code';
+P.pulse(1).bwMHz       = 1;
+P.pulse(1).code        = [1 1 1 1 1 -1 -1 1 1 -1 1 -1 1];
+P.pulse(1).codeRate    = 'chip';
+P.pulse(1).decoder     = [];
+P.pulse(1).decoderForm = 'fir';
+P.pulse(1).decoderRate = 'chip';
+P.pulse(1).decoderLag  = [];
+P.pulse(1).widthUs     = 13;
+P.pulse(1).slope       = 1;
+P.pulse(1).fcMHz       = -1.5;      % frequency diversity: short and long pulses
+                                    % apart, so the long echo does not leak into
+                                    % the short decoder (set 0 if your radar uses one frequency)
+P.pulse(1).delayUs     = 63;        % sent right after pulse 2
 P.pulse(1).window      = 'none';
 P.pulse(1).windowParam = [];
 P.pulse(1).gainDb      = 0;
+P.pulse(1).samples     = [];
 
-% Pulse 2: long LFM pulse
-P.pulse(2).widthUs     = 20;        % p2
-P.pulse(2).bwMHz       = 2;
-P.pulse(2).fcMHz       = 0.8;
-P.pulse(2).slope       = +1;
-P.pulse(2).delayUs     = 0;         % transmitted first
-P.pulse(2).code        = [];
-P.pulse(2).samples     = [];
-P.pulse(2).window      = 'taylor';
-P.pulse(2).windowParam = [4 -35];   % [nbar sidelobe level dB]
-P.pulse(2).gainDb      = 0;
+% Pulse 2: long pulse, 63-chip maximal-length sequence (63 us)
+P.pulse(2)             = P.pulse(1);
+P.pulse(2).code        = rsp_code('mls', 63);
+P.pulse(2).widthUs     = 63;
+P.pulse(2).delayUs     = 0;         % sent first
+P.pulse(2).fcMHz       = 1.5;
 
-%% ------------------------------------------------------------------ Matched filter
+% LFM example (1 MHz, 63 us, Taylor weighting):
+%   P.pulse(2).type = 'lfm';  P.pulse(2).widthUs = 63;  P.pulse(2).bwMHz = 1;
+%   P.pulse(2).window = 'taylor';  P.pulse(2).windowParam = [4 -35];
+% Mismatched decoder example (Barker 13, 39 taps, PSL about -38 dB):
+%   P.pulse(1).decoder = rsp_code_mmf(P.pulse(1).code, 39);
+
+%% ------------------------------------------------------------------ Decoder
 P.mf.enable      = true;
-P.mf.combine     = 'stitch';    % 'stitch' | 'pulse1' | 'pulse2' (any 'pulseK')
-P.mf.switchCell  = [];          % cells 1..switchCell come from the short pulse,
-                                % the rest from the long pulse.
+P.mf.combine     = 'stitch';    % 'stitch' | 'pulse1' | 'pulse2'
+P.mf.switchCell  = [];          % cells 1..switchCell from the short pulse
                                 % [] = automatic = blind zone of the long pulse
-P.mf.norm        = 'noise';     % 'noise' : unit noise gain (noise floor kept)
-                                % 'peak'  : unit amplitude gain for a matched echo
-                                % 'none'  : raw correlation
+P.mf.norm        = 'noise';     % 'noise' : unit noise gain (same floor for both pulses)
+                                % 'peak'  : unit gain for a matched echo
+                                % 'none'  : raw
 P.mf.rangeOffset = 0;           % extra system delay to remove [samples]
-P.mf.keepEach    = true;        % also return each pulse's own MF output
+P.mf.keepEach    = false;       % also return each pulse's own output
 
 %% ------------------------------------------------------------------ Canceler (MTI)
 P.canceler.enable    = true;
-P.canceler.order     = 3;       % number of pulses: 2, 3 (default), 4, ...
-P.canceler.weights   = [];      % custom slow-time taps (overrides order),
-                                % e.g. [1 -2 1]. [] = binomial weights
-P.canceler.normalize = false;   % true = divide taps by their norm (unit noise gain)
-P.canceler.output    = 'same';  % 'same'  : keep all pulses, transient rows = 0
-                                % 'valid' : drop the (order-1) transient rows
+P.canceler.order     = 3;       % number of pulses: 2, 3 (default), 4 ...
+P.canceler.weights   = [];      % custom slow-time taps, e.g. [1 -2 1]; [] = binomial
+P.canceler.normalize = false;   % true = unit noise gain
+P.canceler.output    = 'same';  % 'same' (first rows 0) | 'valid' (drop them)
 
 %% ------------------------------------------------------------------ Doppler FFT
-P.fft.nPulses     = 16;         % pulses per FFT (CPI length)
-P.fft.nfft        = 16;         % FFT size (>= nPulses, zero padded)
-P.fft.hop         = 1;          % pulses between consecutive FFTs
-                                % 1 = sliding (one output per pulse)
-                                % nPulses = non-overlapping CPIs
-P.fft.window      = 'hamming';  % same choices as the pulse window
+P.fft.nPulses     = 16;         % pulses per FFT
+P.fft.nfft        = 16;         % FFT size (>= nPulses)
+P.fft.hop         = 1;          % pulses between FFTs (1 = one FFT per pulse)
+P.fft.window      = 'hamming';
 P.fft.windowParam = [];
 P.fft.norm        = 'none';     % 'none' | 'noise' | 'peak'
-P.fft.shift       = false;      % true = fftshift (zero Doppler in the middle)
-P.fft.chunk       = 64;         % FFT frames processed per block (memory control)
+P.fft.shift       = false;      % true = zero Doppler in the middle bin
+P.fft.chunk       = 64;         % frames per block (memory control)
 
 %% ------------------------------------------------------------------ Non-coherent integration
-P.nci.nFrames = 4;              % n : buffer length (consecutive FFT outputs per bin)
-P.nci.law     = 'square';       % detector law: 'square' |x|^2 | 'linear' |x| | 'log' dB
-P.nci.average = true;           % true = mean over the buffer, false = sum
-P.nci.output  = 'valid';        % 'valid' : only full buffers
-                                % 'same'  : keep all frames (partial buffers at start)
+P.nci.nFrames = 4;              % n : consecutive FFT outputs per bin
+P.nci.law     = 'square';       % 'square' |x|^2 | 'linear' |x| | 'log' dB
+P.nci.average = true;           % mean (true) or sum (false)
+P.nci.output  = 'valid';        % 'valid' | 'same'
 
 %% ------------------------------------------------------------------ CFAR
-P.cfar.type          = 'SO';    % 'SO' (smallest-of) | 'CA' | 'GO'
-P.cfar.nRef          = 16;      % reference cells on EACH side
-P.cfar.nGuard        = 3;       % guard cells on EACH side
-P.cfar.thresholdMode = 'pfa';   % 'pfa'    : multiplier computed from P.cfar.pfa
-                                % 'factor' : multiplier given by P.cfar.factorDb
-P.cfar.pfa           = 1e-6;    % design probability of false alarm
-P.cfar.factorDb      = 13;      % threshold factor [dB] when thresholdMode = 'factor'
-P.cfar.nIntEffective = [];      % effective looks per integrated cell (Pfa design)
-                                % [] = computed from the canceler, FFT window,
-                                %      hop and nci.nFrames (see rsp_cfar_looks)
-P.cfar.nRefEffective = [];      % effective independent cells per reference window
-                                % [] = computed from the matched filter, whose
-                                %      output noise is correlated in range
-P.cfar.edge          = 'oneSided'; % range edges where one window is incomplete:
-                                % 'oneSided' : use the complete side only
-                                % 'partial'  : use the available cells
-                                % 'none'     : no detection there
-P.cfar.bins          = [];      % Doppler bins to test ([] = all)
-P.cfar.rangeCells    = [];      % [first last] range cells to test ([] = all)
+P.cfar.type          = 'SO';    % 'SO' | 'CA' | 'GO'
+P.cfar.nRef          = 48;      % reference cells on EACH side (8 chips at fs = 6 MHz)
+P.cfar.nGuard        = 8;       % guard cells on EACH side
+P.cfar.thresholdMode = 'pfa';   % 'pfa' | 'factor'
+P.cfar.pfa           = 1e-6;
+P.cfar.factorDb      = 13;      % used when thresholdMode = 'factor'
+P.cfar.nIntEffective = [];      % [] = from canceler, window, hop, nFrames (rsp_cfar_looks)
+P.cfar.nRefEffective = [];      % [] = from the decoder's noise correlation
+P.cfar.edge          = 'oneSided';  % 'oneSided' | 'partial' | 'none'
+P.cfar.bins          = [];      % Doppler bins tested ([] = all)
+P.cfar.rangeCells    = [];      % [first last] cells tested ([] = all)
+P.cfar.mapValue      = 'value'; % CFAR output on detections: 'value' (integrated
+                                % value, like the log lane) | 'snr' (value / noise
+                                % estimate: bins compare fairly in the max stage)
+P.cfar.validOnly     = true;    % run only on cells whose echo is received in full
+                                % (outside: partly eclipsed or cut by the record end)
+
+%% ------------------------------------------------------------------ Output (after CFAR)
+P.output.bins        = [];      % bins taken into the max after CFAR ([] = all),
+                                % e.g. 5 to see bin 5 only, or [2:16] without zero Doppler
+P.output.keepDoppler = true;    % keep the complex FFT output in rsp_chain
+
+%% ------------------------------------------------------------------ Plot extraction
+P.plots.gapPulses = 3;          % detections closer than this (pulses) ...
+P.plots.gapCells  = 6;          % ... and this (range cells) belong to one plot
+P.plots.minHits     = 10;       % fewer detections than this = discarded
+P.plots.minWidthDeg = 1;        % narrower in azimuth than this = discarded
+                                % (a target lasts about one beamwidth)
+
+%% ------------------------------------------------------------------ PPI display
+P.ppi.source      = 'max';      % 'max' (output after CFAR) | 'video' | 'decoder' | 'canceler'
+P.ppi.maxRangeKm  = [];         % [] = whole record
+P.ppi.pixels      = 800;        % image size
+P.ppi.ringKm      = 20;         % range ring spacing
+P.ppi.climDb      = [];         % colour limits [dB], [] = automatic
+P.ppi.fadeDb      = 12;         % afterglow: fading over one revolution [dB]
+P.ppi.showPlots   = true;       % mark extracted plots
+P.ppi.colormap    = 'phosphor'; % 'phosphor' or any MATLAB colormap name
+P.ppi.blockPulses = 500;        % pulses processed (and painted) per step
 end

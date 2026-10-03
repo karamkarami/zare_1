@@ -1,28 +1,29 @@
-%MAIN_RSP Run the processing chain on MCPS video and check every block.
+%MAIN_RSP Process one block of MCPS video and check every block of the chain.
 %
-%   video -> matched filter -> 3-pulse canceler -> Doppler FFT
-%         -> non-coherent integration -> SO-CFAR
+%   video -> decoder -> 3-pulse canceler -> Doppler FFT -> integration
+%         -> SO-CFAR -> max over bins -> plots
 %
 %   Steps
-%     1. input   : the MCPS log (read_mcps), the workspace of main_mcps.m,
-%                  or synthetic data
-%     2. params  : every value of the chain, edit them here
+%     1. input   : workspace of main_mcps.m, the MCPS log, or simulated data
+%     2. params  : radar_params.m (your codes, decoders, fs, PRF ...)
 %     3. chain   : full chain from the video
 %     4. compare : a) full chain against every log lane
 %                  b) every block fed with the previous LOG lane, so a
 %                     mismatch points at one block only
-%     5. plots
+%     5. output  : plots (range m, azimuth deg, velocity m/s), figures, PPI sector
 clc;
 here = fileparts(mfilename('fullpath'));
 addpath(here);
 
 %% 1. Input ---------------------------------------------------------------------------
-% 'workspace' : use video / decoder / canceler / integral / cfar already in
-%               the workspace (run main_mcps.m first)
+% 'workspace' : video / decoder / canceler / integral / cfar already in the
+%               workspace (run main_mcps.m first)
 % 'log'       : read the log here (needs read_mcps on the path)
-% 'simulate'  : synthetic targets + clutter + noise (no reference lanes)
-source = 'workspace';
-scan   = 1;
+% 'simulate'  : 350 simulated pulses (targets, weak clutter, antenna pattern)
+source  = 'workspace';
+scanNum = 1;
+
+P = radar_params();
 
 switch source
     case 'workspace'
@@ -31,13 +32,26 @@ switch source
         end
     case 'log'
         mcps = read_mcps('', {}, 'offset', 0, 'count', 10000);
-        [video, videoInfo] = mcps.matrix('video', scan);
-        decoder  = mcps.matrix('decoder', scan);
-        canceler = mcps.matrix('canceler', scan);
-        integral = mcps.matrix('integral', scan);
-        cfar     = mcps.matrix('cfar', scan);
+        [video, videoInfo] = mcps.matrix('video', scanNum);
+        decoder  = mcps.matrix('decoder', scanNum);
+        canceler = mcps.matrix('canceler', scanNum);
+        integral = mcps.matrix('integral', scanNum);
+        cfar     = mcps.matrix('cfar', scanNum);
     case 'simulate'
+        S = struct('nRange', 5469, 'noisePower', 1, 'blankTx', true, 'seed', 1);
+        S.targets = struct('rangeM',      {6000, 40000, 90000}, ...
+                           'azDeg',       {5,    6,     7}, ...
+                           'velocityMps', {40,   -75,   200}, ...
+                           'snrDb',       {-10,  -15,   -18});
+        S.clutter = struct('cnrDb', 20, 'maxRangeM', 25000, 'sigmaVMps', 0.5, 'textureDb', 3);
+        video = rsp_simulate(P, S, (1:350)');
         decoder = []; canceler = []; integral = []; cfar = [];
+        tr = rsp_truth(P, S);
+        fprintf('Simulated targets: az [deg]  range [m]  vel [m/s]  measured vel [m/s]  bin\n');
+        for k = 1:numel(tr)
+            fprintf('                  %8.2f %10.0f %10.1f %14.1f %8d\n', tr(k).azDeg, ...
+                    tr(k).rangeM, tr(k).velocityMps, tr(k).foldedMps, tr(k).bin);
+        end
     otherwise
         error('main_rsp:input', 'Unknown source "%s".', source);
 end
@@ -47,75 +61,23 @@ if ~exist('canceler', 'var'), canceler = []; end
 if ~exist('integral', 'var'), integral = []; end
 if ~exist('cfar', 'var'),     cfar     = []; end
 
-%% 2. Parameters ----------------------------------------------------------------------
-P = rsp_default_params();
-
-% Sampling and the two pulses (p1, p2 in us, fs in MHz)
-P.fs = 4;
-
-P.pulse(1).widthUs     = 2;          % p1 : short pulse
-P.pulse(1).bwMHz       = 0;          % 0 = unmodulated
-P.pulse(1).fcMHz       = -1.2;
-P.pulse(1).delayUs     = 20;         % starts after the long pulse
-P.pulse(1).window      = 'none';
-
-P.pulse(2).widthUs     = 20;         % p2 : long LFM pulse
-P.pulse(2).bwMHz       = 2;
-P.pulse(2).fcMHz       = 0.8;
-P.pulse(2).slope       = +1;
-P.pulse(2).delayUs     = 0;
-P.pulse(2).window      = 'taylor';
-P.pulse(2).windowParam = [4 -35];
-
-% Matched filter
-P.mf.combine    = 'stitch';          % 'stitch' | 'pulse1' | 'pulse2'
-P.mf.switchCell = [];                % [] = blind zone of the long pulse
-P.mf.norm       = 'noise';
-
-% Canceler
-P.canceler.order  = 3;
-P.canceler.output = 'same';
-
-% Doppler FFT
-P.fft.nPulses = 16;
-P.fft.nfft    = 16;
-P.fft.hop     = 1;
-P.fft.window  = 'hamming';
-
-% Non-coherent integration
-P.nci.nFrames = 4;                   % n consecutive outputs per bin
-P.nci.law     = 'square';
-P.nci.average = true;
-
-% CFAR
-P.cfar.type          = 'SO';
-P.cfar.nRef          = 16;
-P.cfar.nGuard        = 3;
-P.cfar.thresholdMode = 'pfa';        % or 'factor' with P.cfar.factorDb
-P.cfar.pfa           = 1e-6;
-P.cfar.factorDb      = 13;
-
-if strcmp(source, 'simulate')
-    S.nPulses    = 350;
-    S.nRange     = 5469;
-    S.noisePower = 1;
-    S.blankTx    = true;
-    S.seed       = 1;
-    S.targets    = struct('rangeCell', {50, 1000, 2500, 4000}, ...
-                          'fdNorm',    {0.25, 3/16, -0.31, 0.02}, ...
-                          'snrDb',     {0, -10, -15, -10});
-    S.clutter    = struct('cnrDb', 40, 'cells', [1 1500], 'spreadNorm', 0.01);
-    video = rsp_simulate(P, S);
-end
-
 %% 3. Full chain ----------------------------------------------------------------------
 out = rsp_chain(video, P);
-fprintf('Chain: %d x %d video, switch cell %d, %d detections\n', size(video), ...
-        out.mf.switchCell, numel(out.cfar.list.range));
-fprintf('Time [s]: decoder %.2f  canceler %.2f  doppler %.2f  integral %.2f  cfar %.2f\n', ...
-        out.time.decoder, out.time.canceler, out.time.doppler, out.time.integral, out.time.cfar);
-fprintf('CFAR factor %s dB, effective looks %s, effective ref cells %s\n\n', ...
-        mat2str(10*log10(out.cfar.factor), 3), mat2str(out.nInt, 3), mat2str(out.nRef, 3));
+fprintf('Chain: %d x %d video, switch cell %d, valid cells %d..%d\n', size(video), ...
+        out.mf.switchCell, out.mf.validCells);
+for k = 1:numel(P.pulse)
+    d = out.mf.dec{k};
+    fprintf('  pulse %d: %-4s %4d samples  PSL %6.1f dB  ISL %6.1f dB  loss %4.2f dB  lag %d\n', ...
+            k, P.pulse(k).type, numel(d.tx), d.pslDb, d.islDb, abs(d.lossDb), d.lag);
+    if d.lossDb < -3
+        warning('main_rsp:decoder', ['Pulse %d decoder loses %.1f dB against a matched ' ...
+                'filter: check decoderForm (''fir'' / ''reference'') and decoderRate.'], k, -d.lossDb);
+    end
+end
+fprintf('Time [s]: decoder %.2f  canceler %.2f  doppler %.2f  integral %.2f  cfar %.2f  max %.2f\n', ...
+        out.time.decoder, out.time.canceler, out.time.doppler, out.time.integral, ...
+        out.time.cfar, out.time.max);
+fprintf('CFAR factor %s dB\n\n', mat2str(10*log10(out.cfar.factor), 3));
 
 %% 4. Comparison with the log lanes -----------------------------------------------------
 if ~isempty(decoder) || ~isempty(canceler) || ~isempty(integral) || ~isempty(cfar)
@@ -152,14 +114,41 @@ if ~isempty(decoder) || ~isempty(canceler) || ~isempty(integral) || ~isempty(cfa
         clear blkDoppler
     end
     if ~isempty(integral) && ~isempty(cfar)
-        blkCfar = rsp_cfar(integral, P.cfar, P.nci.law, out.nInt, out.nRef);
+        if P.cfar.validOnly
+            blkCfar = rsp_cfar_cells(integral, P, out.mf.validCells, out.nInt, out.nRef);
+        else
+            blkCfar = rsp_cfar(integral, P.cfar, P.nci.law, out.nInt, out.nRef);
+        end
         rsp_compare(cfar, blkCfar.map, 'cfar      <- log integral');
     end
-
     % Visual check of one lane, e.g.:
     % rsp_compare(decoder, out.decoder, 'decoder', 'plot', true);
 end
 
-%% 5. Plots ----------------------------------------------------------------------------
+%% 5. Output -----------------------------------------------------------------------------
+% pulse numbers and azimuth of the rows (from the log when available)
+g = rsp_geometry(P, size(video, 2), (1:size(video, 1))');
+if exist('videoInfo', 'var') && isfield(videoInfo, 'azimuthDeg')
+    g.azDeg = double(videoInfo.azimuthDeg(:));
+end
+
+% plots from the max output
+[f, c] = find(out.max.value > 0);
+lin    = sub2ind(size(out.max.value), f, c);
+det    = struct('pulse', out.idx.max(f), 'cell', c, ...
+                'bin', double(out.max.bin(lin)), 'value', double(out.max.value(lin)), ...
+                'azDeg', g.azDeg(out.idx.max(f)));
+plots  = rsp_extract_plots(det, P, size(video, 2));
+fprintf('\n%d plots\n   az [deg]   range [m]   vel [m/s]  bin   power [dB]  hits\n', numel(plots.azDeg));
+for i = 1:numel(plots.azDeg)
+    fprintf('  %8.2f  %10.0f   %8.1f  %3d   %9.1f  %5d\n', plots.azDeg(i), plots.rangeM(i), ...
+            plots.velocityMps(i), plots.bin(i), plots.powerDb(i), plots.hits(i));
+end
+
 rsp_plot(out, video);
-% rsp_plot(out, video, 'range', [1 1500], 'bin', 5);
+% rsp_plot(out, video, 'bin', 7, 'bins', [2:16], 'range', [1 2000]);
+
+% PPI of this block (one sector)
+ppi  = rsp_ppi_init(P, g.rangeM, 'PPI - this block');
+rows = 10*log10(double(out.max.value));
+ppi  = rsp_ppi_update(ppi, g.azDeg(out.idx.max), rows, plots, 'Output after CFAR + max');

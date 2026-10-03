@@ -14,7 +14,8 @@ function out = rsp_cfar(S, C, law, nInt, nRefEff)
 %
 %   out.det        logical, detections                      (size of S)
 %   out.threshold  single, detection threshold              (size of S)
-%   out.map        single, S on detections and 0 elsewhere  (size of S)
+%   out.map        single, on detections S (C.mapValue = 'value') or S over
+%                  its noise estimate ('snr', linear), 0 elsewhere (size of S)
 %   out.factor     threshold multiplier of each bin (dB offset for the 'log' law)
 %   out.list       table-like struct of detections: frame, range, bin,
 %                  value, threshold, snrDb (value over noise estimate)
@@ -123,7 +124,20 @@ for b = bins
 end
 
 out.map = zeros(nF, R, nB, 'single');
-out.map(out.det) = S(out.det);
+switch lower(C.mapValue)
+    case 'value'                                       % integrated value
+        out.map(out.det) = S(out.det);
+    case 'snr'                                         % value over the noise estimate
+        if isLog
+            nz = double(out.threshold(out.det)) - reshape(factor(binOf(out.det)), [], 1);
+            out.map(out.det) = 10.^((double(S(out.det)) - nz)/10);
+        else
+            nz = double(out.threshold(out.det)) ./ reshape(factor(binOf(out.det)), [], 1);
+            out.map(out.det) = double(S(out.det)) ./ nz;
+        end
+    otherwise
+        error('rsp_cfar:mapValue', 'Unknown P.cfar.mapValue "%s".', C.mapValue);
+end
 
 % --- detection list -----------------------------------------------------------
 k = find(out.det);
@@ -149,4 +163,9 @@ a(~na) = 0;
 b(~nb) = 0;
 m = (a + b) ./ (na + nb);
 m(~(na | nb)) = NaN;
+end
+
+function b = binOf(mask)
+% Doppler bin (3rd index) of every true element of a 3-D mask.
+[~, ~, b] = ind2sub(size(mask), find(mask));
 end

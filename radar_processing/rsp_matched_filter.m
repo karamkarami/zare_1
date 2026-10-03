@@ -1,59 +1,51 @@
 function [Y, info] = rsp_matched_filter(X, P)
-%RSP_MATCHED_FILTER Pulse compression of a multi-pulse (e.g. short + long) waveform.
+%RSP_MATCHED_FILTER Pulse compression of a two-pulse (short + long) waveform.
 %
 %   [Y, info] = rsp_matched_filter(X, P)
 %
 %   X    : video, pulses x range samples (complex baseband)
-%   P    : parameter struct (uses P.fs, P.pulse, P.mf)
+%   P    : parameters (uses P.fs, P.pulse, P.mf)
 %   Y    : decoder output, pulses x range cells (same size as X)
-%   info : .replica       cell, matched-filter taps of each pulse
-%          .delay         transmit delay of each pulse [samples]
-%          .length        length of each pulse [samples]
-%          .switchCell    number of near cells taken from the short pulse
-%          .shortPulse    index of the short pulse
-%          .longPulse     index of the long pulse
-%          .nfft          FFT length used
-%          .each          cell, MF output of each pulse (if P.mf.keepEach)
+%   info : .dec          rsp_decoder output of each pulse (h, lag, PSL, loss ...)
+%          .replica      cell, correlation reference of each pulse
+%          .delay        transmit delay of each pulse [samples]
+%          .length       length of each pulse [samples]
+%          .switchCell   cells 1..switchCell come from the short pulse
+%          .validCells   [first last] cells whose echo is received in full
+%                        (transmit eclipsing at the start, record end at the end)
+%          .shortPulse, .longPulse   pulse indices
+%          .nfft         FFT length
+%          .each         cell, output of each pulse (if P.mf.keepEach)
 %
-%   Range alignment: output cell r (1-based) holds the response of a
-%   scatterer whose echo starts at sample r + delay of that pulse, i.e. all
-%   pulses are aligned to the same range grid before they are combined.
+%   Each pulse is either an LFM or a phase code, decoded with the matched
+%   filter or with your own decoder taps (see rsp_decoder). The correlation
+%   runs in the frequency domain: one forward FFT of the data and one
+%   inverse FFT per pulse, without circular wrap-around.
 %
-%   The correlation is done in the frequency domain with one forward FFT of
-%   the data and one inverse FFT per pulse (no circular wrap-around).
+%   Range alignment: output cell r (1-based) holds the main peak of a
+%   scatterer whose echo of pulse k starts at sample r-1 + delay_k, for every
+%   pulse and every decoder (the decoder peak lag is removed).
 
 [M, R] = size(X);
 cls    = class(X);
 mf     = P.mf;
 nP     = numel(P.pulse);
 
-% --- replicas -----------------------------------------------------------
-h = cell(1, nP);
-L = zeros(1, nP);
-d = zeros(1, nP);
+dec = cell(1, nP);
+h   = cell(1, nP);
+L   = zeros(1, nP);
+d   = zeros(1, nP);
 for k = 1:nP
-    pk = P.pulse(k);
-    s  = rsp_waveform(pk, P.fs);
-    w  = rsp_window(pk.window, numel(s), pk.windowParam);
-    hk = s .* w;
-    switch lower(mf.norm)
-        case 'noise', hk = hk / norm(hk);              % noise power gain = 1
-        case 'peak',  hk = hk / abs(sum(s .* conj(hk)));  % matched echo peak = |amplitude|
-        case 'none'
-        otherwise, error('rsp_matched_filter:norm', 'Unknown P.mf.norm "%s".', mf.norm);
-    end
-    if isfield(pk, 'gainDb') && ~isempty(pk.gainDb)
-        hk = hk * 10^(pk.gainDb/20);
-    end
-    h{k} = hk;
-    L(k) = numel(hk);
-    d(k) = round(pk.delayUs * P.fs);
+    dec{k} = rsp_decoder(P.pulse(k), P.fs, mf.norm);
+    h{k}   = dec{k}.h;
+    L(k)   = numel(dec{k}.tx);
+    d(k)   = round(P.pulse(k).delayUs * P.fs);
 end
 
 [~, iLong]  = max(L);
 [~, iShort] = min(L);
 if isempty(mf.switchCell)
-    % Echoes of cells closer than this overlap the transmission of the
+    % Echoes from cells closer than this overlap the transmission of the
     % long pulse (eclipsing): use the short pulse there.
     switchCell = max(d + L) - d(iLong);
 else
@@ -61,53 +53,66 @@ else
 end
 switchCell = min(max(round(switchCell), 0), R);
 
-info = struct('replica', {h}, 'delay', d, 'length', L, 'switchCell', switchCell, ...
-              'shortPulse', iShort, 'longPulse', iLong, 'nfft', 0, 'each', {{}});
+% cells received in full: the short pulse echo clears the transmission
+% at the start, the long pulse echo still fits in the record at the end
+iFirst = iShort;
+iLast  = iLong;
+if nP > 1 && strncmpi(mf.combine, 'pulse', 5)
+    iFirst = str2double(mf.combine(6:end));
+    iLast  = iFirst;
+end
+first = max(d + L) - d(iFirst) + 1;
+last  = R - L(iLast) - d(iLast) + 1;
+validCells = [min(max(first, 1), R) min(max(last, 1), R)];
 
+info = struct('dec', {dec}, 'replica', {h}, 'delay', d, 'length', L, ...
+              'switchCell', switchCell, 'validCells', validCells, ...
+              'shortPulse', iShort, 'longPulse', iLong, 'nfft', 0, 'each', {{}});
 if ~mf.enable
     Y = X;
     return
 end
 
-% --- which pulses are needed ----------------------------------------------
+% --- pulses to compute -----------------------------------------------------------
 combine = lower(mf.combine);
 if nP == 1
-    sel  = 1;
-    need = 1;
+    sel = 1;
 elseif strcmp(combine, 'stitch')
-    sel  = [];
-    need = unique([iShort iLong]);
+    sel = [];
 elseif strncmp(combine, 'pulse', 5)
     sel = str2double(combine(6:end));
     if isnan(sel) || sel < 1 || sel > nP
         error('rsp_matched_filter:combine', 'P.mf.combine = "%s" is not a valid pulse.', mf.combine);
     end
-    need = sel;
 else
     error('rsp_matched_filter:combine', 'Unknown P.mf.combine "%s".', mf.combine);
 end
 if mf.keepEach
     need = 1:nP;
+elseif isempty(sel)
+    need = unique([iShort iLong]);
+else
+    need = sel;
 end
 
-% --- frequency-domain correlation ------------------------------------------
-nfft      = fastLength(R + max(L) - 1);
+% --- frequency-domain correlation ---------------------------------------------------
+Lh        = max(cellfun(@numel, h));
+nfft      = fastLength(R + Lh - 1);
 info.nfft = nfft;
 FX        = fft(X, nfft, 2);
 each      = cell(1, nP);
 cells     = 0:R-1;
 for k = need
     Hk  = conj(fft(cast(h{k}, cls), nfft)).';           % 1 x nfft
-    yk  = ifft(FX .* Hk, [], 2);                         % y[n] = sum x[n+m] h*[m]
-    n   = cells + d(k) + mf.rangeOffset;                 % lag of each output cell
-    ok  = n >= 0 & n <= R-1;
+    yk  = ifft(FX .* Hk, [], 2);                         % y(n) = sum x(n+m) h*(m)
+    n   = cells + d(k) + dec{k}.lag + mf.rangeOffset;    % lag read by each cell
+    ok  = n >= -(numel(h{k}) - 1) & n <= R - 1;
     out = complex(zeros(M, R, cls));
-    out(:, ok) = yk(:, n(ok) + 1);
+    out(:, ok) = yk(:, mod(n(ok), nfft) + 1);
     each{k} = out;
 end
 clear FX yk
 
-% --- combine ---------------------------------------------------------------
 if isempty(sel)
     Y = each{iLong};
     Y(:, 1:switchCell) = each{iShort}(:, 1:switchCell);
