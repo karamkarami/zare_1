@@ -27,6 +27,12 @@ scan = rsp_scan(P, S, 'degrees', 360);   % simulated scan + live PPI
 rsp_ppi_replay(scan, 'speed', 1, 'bins', [6 7 8]);   % replay at 6 rpm, chosen bins only
 ```
 
+Example output (Octave rendering; MATLAB draws the PPI on black):
+
+| PPI after one simulated revolution | Blocks of one 350-pulse block |
+|---|---|
+| ![PPI](docs/ppi_full_scan.png) | ![Blocks](docs/chain_blocks.png) |
+
 ## Pulses and decoders
 
 Each pulse is either `type = 'code'` or `type = 'lfm'`. The bandwidth `bwMHz = 1` gives
