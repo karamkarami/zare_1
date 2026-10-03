@@ -88,8 +88,10 @@ for a = 0:30:330
          'Color', [0 0.8 0], 'HorizontalAlignment', 'center', 'Parent', h.ax, 'FontSize', 9);
 end
 h.sweep  = plot(h.ax, [0 0], [0 rMax/1e3], '-', 'Color', [0.6 1 0.6], 'LineWidth', 1.5);
-h.marker = plot(h.ax, NaN, NaN, 's', 'Color', [1 0.85 0.2], 'MarkerSize', 9, 'LineWidth', 1.2);
-h.labels = [];
+h.trail  = plot(h.ax, NaN, NaN, '.', 'Color', [0.75 0.6 0.15], 'MarkerSize', 8);
+h.marker = plot(h.ax, NaN, NaN, 's', 'Color', [1 0.85 0.2], 'MarkerSize', 10, 'LineWidth', 1.2);
+h.labels = {};
+h.labelSig = [];
 h.title  = title(h.ax, ttl, 'Color', [0.6 1 0.6]);
 h.rMax   = rMax;
 end

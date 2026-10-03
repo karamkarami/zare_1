@@ -14,15 +14,17 @@ function out = rsp_chain(video, P, cache)
 %   out.cfar      struct (det, threshold, map, factor, list), see rsp_cfar
 %                 (only on out.mf.validCells when P.cfar.validOnly)
 %   out.max       output stage after the CFAR (rsp_cfar_max over P.output.bins):
-%                 .value frames x range, .bin frames x range (uint8)
+%                 .value, .bin, .binFrac (refined Doppler), .marginDb (over
+%                 the threshold), all frames x range
 %   out.mf        decoder info (replicas, alignment, PSL, loss, switch cell ...)
 %   out.idx       pulse index of each output row, per block, to align the
 %                 rows with the log lanes (e.g. videoInfo.pulseSeq(idx))
 %   out.nInt      effective looks per integrated cell, per bin (CFAR design)
 %   out.nRef      effective independent cells per reference window, per bin
 %   out.cache     CFAR design, pass it back for the next block
+%   out.cfarWindow guard / reference cells used (rsp_cfar_window)
 %   out.time      processing time of each block [s]
-%   out.P         parameters used
+%   out.P         parameters used (with the CFAR window filled in)
 
 if ~isfloat(video)
     video = single(video);
@@ -50,6 +52,7 @@ if ~P.output.keepDoppler
 end
 
 t = tic;
+[P, out.cfarWindow] = rsp_cfar_window(P, out.mf);           % fills an empty nGuard / nRef
 if nargin < 3 || isempty(cache)
     [cache.nInt, cache.nRef] = rsp_cfar_looks(P, out.mf.replica{out.mf.longPulse});
 end
@@ -65,7 +68,7 @@ out.time.cfar = toc(t);
 out.idx.cfar  = out.idx.integral;
 
 t = tic;
-[out.max.value, out.max.bin] = rsp_cfar_max(out.cfar.map, P.output.bins);
+out.max = rsp_cfar_max(out.cfar, P.output.bins, out.integral, P.nci.law);
 out.time.max = toc(t);
 out.idx.max  = out.idx.cfar;
 

@@ -1,11 +1,17 @@
-function dec = rsp_decoder(pulse, fs, norm)
+function dec = rsp_decoder(pulse, fs, norm, chan)
 %RSP_DECODER Receive filter (decoder) of one pulse and its quality figures.
 %
-%   dec = rsp_decoder(pulse, fs, norm)
+%   dec = rsp_decoder(pulse, fs, norm, chan)
 %
 %   pulse : one entry of P.pulse
 %   fs    : sampling frequency [MHz]
 %   norm  : 'noise' (unit noise gain) | 'peak' (unit gain for a matched echo) | 'none'
+%   chan  : channel filter (optional), P.mf fields:
+%           .channelFilter    true = band-pass FIR at the pulse frequency before
+%                             the decoder (separates the frequency channels
+%                             of the two pulses, as a dual-frequency receiver)
+%           .channelBwFactor  passband = factor * pulse bandwidth (1.5)
+%           .channelRejectDb  stopband rejection (60 dB)
 %
 %   dec.tx      transmitted samples (column)
 %   dec.h       correlation reference: y(n) = sum_m x(n+m) conj(h(m))
@@ -14,6 +20,7 @@ function dec = rsp_decoder(pulse, fs, norm)
 %   dec.lossDb  mismatch loss against a matched filter (0 dB = matched)
 %   dec.pslDb   peak sidelobe level of the compressed pulse
 %   dec.islDb   integrated sidelobe level
+%   dec.mainlobe first nulls around the peak [samples], e.g. [-12 12]
 %   dec.response compressed pulse (noise free), dec.lags its lags
 %
 %   Decoder
@@ -62,6 +69,11 @@ else
 end
 h = h .* rsp_window(getField(pulse, 'window', 'none'), numel(h), ...
                     getField(pulse, 'windowParam', []));
+if nargin >= 4 && ~isempty(chan) && isfield(chan, 'channelFilter') && chan.channelFilter
+    c = channelFir(getField(pulse, 'fcMHz', 0), getField(pulse, 'bwMHz', 0), ...
+                   numel(tx), fs, chan);
+    h = conv(h, conj(flipud(c)));                    % filter, then correlate with h
+end
 
 % noise-free compressed pulse: lags -(Lh-1) .. Ls-1
 y    = conv(tx, conj(flipud(h)));
@@ -107,6 +119,7 @@ dec.pslDb    = 20*log10(max([side; eps]) / pkAbs);
 dec.islDb    = 10*log10(sum(side.^2) / pkAbs^2 + eps);
 dec.response = y;
 dec.lags     = lags;
+dec.mainlobe = [lags(lo) lags(hi)] - lags(k);           % first nulls around the peak [samples]
 end
 
 function n = norm2(x)
@@ -119,4 +132,28 @@ if isfield(s, name) && ~isempty(s.(name))
 else
     v = default;
 end
+end
+
+function c = channelFir(fc, bw, L, fs, chan)
+% Kaiser-windowed band-pass FIR centred on fc [MHz]: passband +-factor*bw/2,
+% transition bw/2, stopband rejection chan.channelRejectDb.
+if bw <= 0
+    bw = fs / L;                                     % plain pulse: 1/width
+end
+A    = chan.channelRejectDb;
+df   = bw / 2;                                       % transition width [MHz]
+fcut = chan.channelBwFactor * bw / 2 + df / 2;       % -6 dB edge [MHz]
+N    = ceil((A - 8) / (2.285 * 2*pi*df/fs)) + 1;     % Kaiser length estimate
+N    = N + mod(N + 1, 2);                            % odd: linear phase, integer delay
+beta = 0.1102 * (A - 8.7);
+n    = (0:N-1)' - (N-1)/2;
+lp   = 2*fcut/fs * sinc0(2*fcut/fs * n) .* rsp_window('kaiser', N, beta);
+c    = lp .* exp(1j*2*pi*fc*n/fs);
+c    = c / sum(lp);                                  % unit gain at fc
+end
+
+function y = sinc0(x)
+y = ones(size(x));
+k = x ~= 0;
+y(k) = sin(pi*x(k)) ./ (pi*x(k));
 end

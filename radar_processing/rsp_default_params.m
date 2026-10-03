@@ -18,7 +18,8 @@ function P = rsp_default_params()
 %% ------------------------------------------------------------------ Radar
 P.radar.prfHz        = 1000;        % pulse repetition frequency [Hz]
 P.radar.rpm          = 6;           % antenna rotation [rev/min] (36 deg/s)
-P.radar.fcMHz        = 1300;        % carrier frequency [MHz] (L band, lambda = 0.23 m)
+P.radar.fcMHz        = 600;         % carrier frequency [MHz] (UHF, lambda = 0.5 m):
+                                    % unambiguous velocity +-lambda*PRF/4 = +-125 m/s
 P.radar.azStartDeg   = 0;           % antenna azimuth of pulse 1 [deg], 0 = north
 P.radar.rangeOffsetM = 0;           % range of cell 1 [m]
 
@@ -57,12 +58,13 @@ P.fs = 6;                           % complex baseband sampling frequency [MHz]
 %   gainDb       extra gain of this pulse's decoder output
 %   samples      user transmit samples at fs (overrides type / code / LFM)
 
-% Pulse 1: short pulse, Barker 13 (13 us), covers the blind zone of pulse 2
+% Pulse 1: short pulse, Barker 13 (13 us) with a 52-tap mismatched decoder
+% (PSL -48 dB instead of -22 dB, 0.2 dB loss); covers the blind zone of pulse 2
 P.pulse(1).type        = 'code';
 P.pulse(1).bwMHz       = 1;
 P.pulse(1).code        = [1 1 1 1 1 -1 -1 1 1 -1 1 -1 1];
 P.pulse(1).codeRate    = 'chip';
-P.pulse(1).decoder     = [];
+P.pulse(1).decoder     = rsp_code_mmf(P.pulse(1).code, 52);   % [] = matched filter
 P.pulse(1).decoderForm = 'fir';
 P.pulse(1).decoderRate = 'chip';
 P.pulse(1).decoderLag  = [];
@@ -71,24 +73,28 @@ P.pulse(1).slope       = 1;
 P.pulse(1).fcMHz       = -1.5;      % frequency diversity: short and long pulses
                                     % apart, so the long echo does not leak into
                                     % the short decoder (set 0 if your radar uses one frequency)
-P.pulse(1).delayUs     = 63;        % sent right after pulse 2
+P.pulse(1).delayUs     = 100;       % sent right after pulse 2
 P.pulse(1).window      = 'none';
 P.pulse(1).windowParam = [];
 P.pulse(1).gainDb      = 0;
 P.pulse(1).samples     = [];
 
-% Pulse 2: long pulse, 63-chip maximal-length sequence (63 us)
+% Pulse 2: long pulse, LFM 100 us, 1 MHz, Taylor weighted (PSL -41 dB)
 P.pulse(2)             = P.pulse(1);
-P.pulse(2).code        = rsp_code('mls', 63);
-P.pulse(2).widthUs     = 63;
+P.pulse(2).type        = 'lfm';
+P.pulse(2).code        = [];
+P.pulse(2).decoder     = [];
+P.pulse(2).widthUs     = 100;
+P.pulse(2).bwMHz       = 1;
+P.pulse(2).slope       = 1;
 P.pulse(2).delayUs     = 0;         % sent first
 P.pulse(2).fcMHz       = 1.5;
+P.pulse(2).window      = 'taylor';
+P.pulse(2).windowParam = [6 -45];
 
-% LFM example (1 MHz, 63 us, Taylor weighting):
-%   P.pulse(2).type = 'lfm';  P.pulse(2).widthUs = 63;  P.pulse(2).bwMHz = 1;
-%   P.pulse(2).window = 'taylor';  P.pulse(2).windowParam = [4 -35];
-% Mismatched decoder example (Barker 13, 39 taps, PSL about -38 dB):
-%   P.pulse(1).decoder = rsp_code_mmf(P.pulse(1).code, 39);
+% Phase code instead of the LFM (e.g. a 63-chip m-sequence):
+%   P.pulse(2).type = 'code';  P.pulse(2).code = rsp_code('mls', 63);
+%   P.pulse(2).window = 'none';  P.pulse(1).delayUs = 63;
 
 %% ------------------------------------------------------------------ Decoder
 P.mf.enable      = true;
@@ -99,6 +105,13 @@ P.mf.norm        = 'noise';     % 'noise' : unit noise gain (same floor for both
                                 % 'peak'  : unit gain for a matched echo
                                 % 'none'  : raw
 P.mf.rangeOffset = 0;           % extra system delay to remove [samples]
+P.mf.channelFilter   = true;    % band-pass each pulse's frequency channel before
+                                % its decoder (dual-frequency receiver); keeps the
+                                % strong long echo out of the short decoder.
+                                % false = plain decoder (e.g. to match a log)
+P.mf.channelBwFactor = 3;       % passband = factor * pulse bandwidth (3: keeps the
+                                % Barker mismatched decoder at PSL -46 dB)
+P.mf.channelRejectDb = 60;      % stopband rejection [dB]
 P.mf.keepEach    = false;       % also return each pulse's own output
 
 %% ------------------------------------------------------------------ Canceler (MTI)
@@ -119,15 +132,20 @@ P.fft.shift       = false;      % true = zero Doppler in the middle bin
 P.fft.chunk       = 64;         % frames per block (memory control)
 
 %% ------------------------------------------------------------------ Non-coherent integration
-P.nci.nFrames = 4;              % n : consecutive FFT outputs per bin
+P.nci.nFrames = 32;             % n : consecutive FFT outputs per bin. With hop = 1
+                                % the integration spans nPulses + n - 1 = 47 pulses
+                                % (1.7 deg at 6 rpm), inside the 111-pulse beam dwell;
+                                % more looks -> lower CFAR threshold
 P.nci.law     = 'square';       % 'square' |x|^2 | 'linear' |x| | 'log' dB
 P.nci.average = true;           % mean (true) or sum (false)
 P.nci.output  = 'valid';        % 'valid' | 'same'
 
 %% ------------------------------------------------------------------ CFAR
 P.cfar.type          = 'SO';    % 'SO' | 'CA' | 'GO'
-P.cfar.nRef          = 48;      % reference cells on EACH side (8 chips at fs = 6 MHz)
-P.cfar.nGuard        = 8;       % guard cells on EACH side
+P.cfar.nRef          = [];      % reference cells on EACH side
+                                % [] = 16 resolution cells (rsp_cfar_window)
+P.cfar.nGuard        = [];      % guard cells on EACH side
+                                % [] = widest compressed main lobe + 2
 P.cfar.thresholdMode = 'pfa';   % 'pfa' | 'factor'
 P.cfar.pfa           = 1e-6;
 P.cfar.factorDb      = 13;      % used when thresholdMode = 'factor'
@@ -156,12 +174,18 @@ P.plots.minWidthDeg = 1;        % narrower in azimuth than this = discarded
 
 %% ------------------------------------------------------------------ PPI display
 P.ppi.source      = 'max';      % 'max' (output after CFAR) | 'video' | 'decoder' | 'canceler'
+P.ppi.maxScale    = 'margin';   % 'max' painted as: 'margin' (dB over the CFAR
+                                % threshold) | 'value' (integrated value, dB)
 P.ppi.maxRangeKm  = [];         % [] = whole record
 P.ppi.pixels      = 800;        % image size
 P.ppi.ringKm      = 20;         % range ring spacing
 P.ppi.climDb      = [];         % colour limits [dB], [] = automatic
 P.ppi.fadeDb      = 12;         % afterglow: fading over one revolution [dB]
 P.ppi.showPlots   = true;       % mark extracted plots
+P.ppi.trailScans  = 4;          % plots of the last revolutions kept as a trail
 P.ppi.colormap    = 'phosphor'; % 'phosphor' or any MATLAB colormap name
-P.ppi.blockPulses = 500;        % pulses processed (and painted) per step
+P.ppi.blockPulses = 250;        % pulses processed per block
+P.ppi.stepDeg     = 0.5;        % sweep step per screen update [deg]
+P.ppi.speed       = 1;          % sweep speed: 1 = real antenna speed, Inf = as fast
+                                % as possible (processing may be slower)
 end

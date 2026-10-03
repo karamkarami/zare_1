@@ -38,13 +38,16 @@ switch source
         integral = mcps.matrix('integral', scanNum);
         cfar     = mcps.matrix('cfar', scanNum);
     case 'simulate'
-        S = struct('nRange', 5469, 'noisePower', 1, 'blankTx', true, 'seed', 1);
-        S.targets = struct('rangeM',      {6000, 40000, 90000}, ...
-                           'azDeg',       {5,    6,     7}, ...
-                           'velocityMps', {40,   -75,   200}, ...
-                           'snrDb',       {-10,  -15,   -18});
-        S.clutter = struct('cnrDb', 20, 'maxRangeM', 25000, 'sigmaVMps', 0.5, 'textureDb', 3);
+        % 350 pulses (12.6 deg) around the three targets, moved next to each
+        % other in azimuth so that one block sees all of them
+        S = struct('nRange', 5469, 'noiseDb', 0, 'blankTx', true, 'seed', 1);
+        S.targets = struct('rangeM',      {10000, 50000, 80000}, ...
+                           'azDeg',       {4,     6,     8}, ...
+                           'velocityMps', {20,    60,    100}, ...
+                           'powerDb',     {10,    5,     0});
+        S.clutter = struct('powerDb', -50, 'maxRangeM', 25000, 'sigmaVMps', 0.5, 'textureDb', 3);
         video = rsp_simulate(P, S, (1:350)');
+        rsp_budget(P, S);
         decoder = []; canceler = []; integral = []; cfar = [];
         tr = rsp_truth(P, S);
         fprintf('Simulated targets: az [deg]  range [m]  vel [m/s]  measured vel [m/s]  bin\n');
@@ -77,7 +80,8 @@ end
 fprintf('Time [s]: decoder %.2f  canceler %.2f  doppler %.2f  integral %.2f  cfar %.2f  max %.2f\n', ...
         out.time.decoder, out.time.canceler, out.time.doppler, out.time.integral, ...
         out.time.cfar, out.time.max);
-fprintf('CFAR factor %s dB\n\n', mat2str(10*log10(out.cfar.factor), 3));
+fprintf('CFAR %s: %d guard + %d reference cells, factor %s dB\n\n', out.P.cfar.type, ...
+        out.P.cfar.nGuard, out.P.cfar.nRef, mat2str(10*log10(out.cfar.factor), 3));
 
 %% 4. Comparison with the log lanes -----------------------------------------------------
 if ~isempty(decoder) || ~isempty(canceler) || ~isempty(integral) || ~isempty(cfar)
@@ -115,9 +119,9 @@ if ~isempty(decoder) || ~isempty(canceler) || ~isempty(integral) || ~isempty(cfa
     end
     if ~isempty(integral) && ~isempty(cfar)
         if P.cfar.validOnly
-            blkCfar = rsp_cfar_cells(integral, P, out.mf.validCells, out.nInt, out.nRef);
+            blkCfar = rsp_cfar_cells(integral, out.P, out.mf.validCells, out.nInt, out.nRef);
         else
-            blkCfar = rsp_cfar(integral, P.cfar, P.nci.law, out.nInt, out.nRef);
+            blkCfar = rsp_cfar(integral, out.P.cfar, P.nci.law, out.nInt, out.nRef);
         end
         rsp_compare(cfar, blkCfar.map, 'cfar      <- log integral');
     end
@@ -137,12 +141,13 @@ end
 lin    = sub2ind(size(out.max.value), f, c);
 det    = struct('pulse', out.idx.max(f), 'cell', c, ...
                 'bin', double(out.max.bin(lin)), 'value', double(out.max.value(lin)), ...
+                'binFrac', double(out.max.binFrac(lin)), 'marginDb', double(out.max.marginDb(lin)), ...
                 'azDeg', g.azDeg(out.idx.max(f)));
 plots  = rsp_extract_plots(det, P, size(video, 2));
-fprintf('\n%d plots\n   az [deg]   range [m]   vel [m/s]  bin   power [dB]  hits\n', numel(plots.azDeg));
+fprintf('\n%d plots\n   az [deg]   range [m]   vel [m/s]  bin  CFAR margin [dB]  hits\n', numel(plots.azDeg));
 for i = 1:numel(plots.azDeg)
-    fprintf('  %8.2f  %10.0f   %8.1f  %3d   %9.1f  %5d\n', plots.azDeg(i), plots.rangeM(i), ...
-            plots.velocityMps(i), plots.bin(i), plots.powerDb(i), plots.hits(i));
+    fprintf('  %8.2f  %10.0f   %8.1f  %3d  %15.1f  %5d\n', plots.azDeg(i), plots.rangeM(i), ...
+            plots.velocityMps(i), plots.bin(i), plots.marginDb(i), plots.hits(i));
 end
 
 rsp_plot(out, video);
@@ -150,5 +155,6 @@ rsp_plot(out, video);
 
 % PPI of this block (one sector)
 ppi  = rsp_ppi_init(P, g.rangeM, 'PPI - this block');
-rows = 10*log10(double(out.max.value));
+rows = double(out.max.marginDb);                        % dB over the CFAR threshold
+rows(~isfinite(rows)) = -Inf;
 ppi  = rsp_ppi_update(ppi, g.azDeg(out.idx.max), rows, plots, 'Output after CFAR + max');

@@ -8,6 +8,9 @@ function plots = rsp_extract_plots(det, P, nRange)
 %            .bin    Doppler bin (1-based)    .value  output value (linear)
 %            .azDeg  (optional) antenna azimuth of the output row, e.g. from
 %                    the log; otherwise computed from P.radar
+%            .binFrac  (optional) refined Doppler bin (rsp_cfar_max) -> velocity
+%                    between bin centres
+%            .marginDb (optional) level over the CFAR threshold
 %   P      : parameters (P.plots, P.radar, P.fs, P.fft)
 %   nRange : range cells per pulse
 %
@@ -16,8 +19,10 @@ function plots = rsp_extract_plots(det, P, nRange)
 %            .rangeM       amplitude-weighted range centroid [m]
 %            .cell         range cell of the centroid
 %            .bin          Doppler bin of the strongest detection
-%            .velocityMps  radial velocity of that bin [m/s], positive =
-%                          approaching, folded into +-lambda*PRF/4
+%            .velocityMps  radial velocity [m/s], positive = approaching,
+%                          folded into +-lambda*PRF/4; from the refined bins
+%                          (det.binFrac) when given, else the bin centre
+%            .marginDb     largest level over the CFAR threshold [dB]
 %            .powerDb      strongest value [dB]
 %            .hits         number of detections
 %            .pulse        centroid pulse number (output row, chain delay included)
@@ -31,9 +36,11 @@ function plots = rsp_extract_plots(det, P, nRange)
 
 g  = rsp_geometry(P, nRange);
 N  = numel(det.pulse);
+nfft = max(P.fft.nfft, P.fft.nPulses);
 empty = struct('azDeg', zeros(0, 1), 'rangeM', zeros(0, 1), 'cell', zeros(0, 1), ...
                'bin', zeros(0, 1), 'velocityMps', zeros(0, 1), 'powerDb', zeros(0, 1), ...
-               'hits', zeros(0, 1), 'pulse', zeros(0, 1), 'widthDeg', zeros(0, 1));
+               'marginDb', zeros(0, 1), 'hits', zeros(0, 1), 'pulse', zeros(0, 1), ...
+               'widthDeg', zeros(0, 1));
 if N == 0
     plots = empty;
     return
@@ -97,7 +104,23 @@ for i = 1:nPl
     plots.cell(i, 1)        = sum(wk .* c(k)) / sum(wk);
     plots.rangeM(i, 1)      = P.radar.rangeOffsetM + (plots.cell(i) - 1) * g.cellM;
     plots.bin(i, 1)         = double(det.bin(k(im)));
-    plots.velocityMps(i, 1) = g.binVelMps(plots.bin(i));
+    if isfield(det, 'binFrac') && ~isempty(det.binFrac)
+        % power-weighted circular mean of the refined bins (detections within
+        % 10 dB of the strongest one)
+        sel = wk >= pk / 10;
+        ph  = 2*pi * (double(det.binFrac(k(sel))) - 1) / nfft;
+        fb  = angle(sum(wk(sel) .* exp(1j*ph))) / (2*pi);      % cycles / pulse
+        fb  = fb - P.fft.shift * floor(nfft/2) / nfft;
+        fb  = mod(fb + 0.5, 1) - 0.5;
+        plots.velocityMps(i, 1) = fb * P.radar.prfHz * g.lambdaM / 2;
+    else
+        plots.velocityMps(i, 1) = g.binVelMps(plots.bin(i));
+    end
+    if isfield(det, 'marginDb') && ~isempty(det.marginDb)
+        plots.marginDb(i, 1) = max(double(det.marginDb(k)));
+    else
+        plots.marginDb(i, 1) = NaN;
+    end
     plots.powerDb(i, 1)     = 10*log10(pk);
     plots.hits(i, 1)        = numel(k);
     plots.pulse(i, 1)       = sum(wk .* p(k)) / sum(wk);

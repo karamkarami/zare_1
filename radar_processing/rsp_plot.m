@@ -61,7 +61,8 @@ if isempty(opt.bins)
     bt  = 'all';
     if ~isempty(out.P.output.bins), bt = mat2str(out.P.output.bins); end
 else
-    val = rsp_cfar_max(out.cfar.map, opt.bins);
+    mx  = rsp_cfar_max(out.cfar, opt.bins);
+    val = mx.value;
     bt  = mat2str(opt.bins);
 end
 subplot(2, 3, panel + 4);

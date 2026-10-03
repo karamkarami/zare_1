@@ -4,22 +4,24 @@ function [video, state, truth] = rsp_simulate(P, S, pulses, state)
 %   [video, state, truth] = rsp_simulate(P, S, pulses, state)
 %
 %   P      : chain parameters (fs, pulses, P.radar, P.antenna)
-%   S      : scenario
-%     .nRange      range samples per pulse                         (5469)
-%     .noisePower  receiver noise power per sample                 (1)
+%   S      : scenario. Every level is a power PER SAMPLE at the receiver,
+%            in dB on one common scale (e.g. dBm or dB re 1 unit):
+%     .nRange      range samples per pulse                          (5469)
+%     .noiseDb     receiver noise power                             (0 dB)
 %     .blankTx     true = receiver off while transmitting
 %     .seed        random seed
 %     .targets     struct array, one per target:
 %                    rangeM       range at time 0 [m]
 %                    azDeg        azimuth [deg], 0 = north, clockwise
 %                    velocityMps  radial velocity [m/s], positive = approaching
-%                    snrDb        SNR per sample at the beam peak, before
-%                                 pulse compression
-%     .clutter     [] or struct (weak ground clutter, all azimuths):
-%                    cnrDb        clutter-to-noise per sample
+%                    powerDb      echo power at the beam peak, before pulse
+%                                 compression (powerDb - noiseDb = SNR per sample)
+%     .clutter     [] or struct (ground clutter, all azimuths):
+%                    powerDb      mean clutter power
 %                    maxRangeM    clutter extent (power fades over the last 30 %)
 %                    sigmaVMps    spectral spread (wind + scanning) [m/s]
 %                    textureDb    spatial fluctuation (log-normal) [dB]
+%            (older names still work: noisePower [linear], snrDb, cnrDb)
 %   pulses : global pulse numbers of this block (1 = first pulse of the scan);
 %            consecutive blocks continue the same clutter process
 %   state  : [] on the first call, then the returned state
@@ -29,13 +31,19 @@ function [video, state, truth] = rsp_simulate(P, S, pulses, state)
 %            cell, true and folded (measurable) velocity, Doppler bin
 %
 %   Physics: the echo of pulse m from a target at range R(t) = R0 - v t is
-%   the transmitted signal delayed by tau = 2R/c (fractional delay, applied
-%   in the frequency domain) times exp(-j 2 pi f0 tau), so Doppler and range
-%   walk follow from the geometry. The amplitude follows the two-way
-%   antenna pattern as the antenna turns.
+%   the transmitted signal (both pulses, each at its own delay and
+%   frequency) delayed by tau = 2R/c - a fractional delay applied in the
+%   frequency domain - times exp(-j 2 pi f0 tau): Doppler, its sign and the
+%   range walk all follow from the geometry. The amplitude follows the
+%   two-way antenna pattern as the antenna turns. Noise and clutter random
+%   numbers are drawn pulse by pulse, so the video does not depend on how
+%   the scan is split into blocks. Intra-pulse Doppler is neglected (range-
+%   Doppler coupling below 0.3 sample here).
 
 c  = 299792458;
+S  = rsp_levels(S);
 R  = S.nRange;
+N0 = 10^(S.noiseDb/10);                                         % noise power, linear
 pulses = pulses(:);
 M  = numel(pulses);
 g  = rsp_geometry(P, R, pulses);
@@ -68,7 +76,8 @@ if nargin < 4 || isempty(state)
         t = randn(361, state.cells) * cl.textureDb / (20*log10(exp(1)));
         t = filter(ones(1, 3)/3, 1, t, [], 2);
         t(361, :) = t(1, :);                                   % wrap 360 -> 0
-        state.texture = exp(t - mean(t(:)));
+        state.texture = exp(t);
+        state.texture = state.texture / sqrt(mean(state.texture(:).^2));   % unit mean power
         % fade out over the last 30 % of the extent (no hard clutter edge)
         r = (0:state.cells-1) / max(state.cells - 1, 1);
         state.texture = state.texture .* min(1, cos(pi/2 * max(r - 0.7, 0) / 0.3).^2);
@@ -100,7 +109,7 @@ if state.cells > 0
     a0  = floor(g.azDeg);                                       % texture, bilinear in azimuth
     fr  = g.azDeg - a0;
     tex = state.texture(a0 + 1, :) .* (1 - fr) + state.texture(a0 + 2, :) .* fr;
-    amp = sqrt(10^(cl.cnrDb/10) * S.noisePower / sum(abs(tx).^2));
+    amp = sqrt(10^(cl.powerDb/10) / sum(abs(tx).^2));        % per-sample power = powerDb
     SPEC = SPEC + fft(amp * z .* tex, nfft, 2) .* TX;
 end
 
@@ -109,8 +118,8 @@ lossLong = sum(abs(tx).^2) * P.fft.nPulses;                     % coherent gain,
 for k = 1:numel(S.targets)
     tg  = S.targets(k);
     G   = rsp_antenna_pattern(g.azDeg - tg.azDeg, P.antenna);   % one-way power
-    a   = sqrt(10^(tg.snrDb/10) * S.noisePower) * G;           % two-way amplitude
-    if max(a)^2 * lossLong < 0.01 * S.noisePower
+    a   = sqrt(10^(tg.powerDb/10)) * G;                        % two-way amplitude
+    if max(a)^2 * lossLong < 0.01 * N0
         continue                                                % far below the noise
     end
     Rm  = tg.rangeM - tg.velocityMps * g.timeS;                 % range at each pulse
@@ -125,7 +134,7 @@ end
 % --- receiver ------------------------------------------------------------------------------
 rx    = ifft(SPEC, [], 2);
 noise = complex(Z(state.cells + (1:R), :), Z(nZ/2 + state.cells + (1:R), :)).';
-video = rx(:, 1:R) + sqrt(S.noisePower/2) * noise;
+video = rx(:, 1:R) + sqrt(N0/2) * noise;
 if S.blankTx
     video(:, 1:min(txLen, R)) = 0;
 end

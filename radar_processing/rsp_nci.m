@@ -29,7 +29,13 @@ switch lower(C.law)
 end
 
 if n > 1
-    S = filter(ones(n, 1, class(S)), 1, S, [], 1);       % running sum over frames
+    % running sum over n frames from a cumulative sum (cost independent of n),
+    % in double and one Doppler bin at a time (accuracy, bounded memory)
+    for b = 1:size(S, 3)
+        cs = cumsum(double(S(:, :, b)), 1);
+        cs(n+1:end, :) = cs(n+1:end, :) - cs(1:end-n, :);
+        S(:, :, b) = cs;
+    end
 end
 if C.average
     S = S / n;

@@ -70,26 +70,36 @@ set(h.ax, 'CLim', h.clim);
 th = mod(h.azAbs, 360) * pi/180;
 set(h.sweep, 'XData', [0 sin(th)] * h.rMax/1e3, 'YData', [0 cos(th)] * h.rMax/1e3);
 
-% --- plots: replace the ones swept again, add the new ones -----------------------------------
+% --- plots: current revolution as labelled squares, older ones as a fading trail ----------
 if h.P.ppi.showPlots
-    old = (h.azAbs - h.plots.az) >= 360;
-    h.plots.az(old) = [];  h.plots.x(old) = [];  h.plots.y(old) = [];  h.plots.v(old) = [];
     if nargin >= 4 && ~isempty(plots) && ~isempty(plots.azDeg)
-        pa = h.azAbs - mod(h.azAbs - plots.azDeg(:), 360);          % unwrapped
+        pa = h.azAbs - mod(h.azAbs - plots.azDeg(:), 360);          % unwrapped azimuth
         h.plots.az = [h.plots.az; pa];
         h.plots.x  = [h.plots.x;  plots.rangeM(:) .* sin(plots.azDeg(:)*pi/180) / 1e3];
         h.plots.y  = [h.plots.y;  plots.rangeM(:) .* cos(plots.azDeg(:)*pi/180) / 1e3];
         h.plots.v  = [h.plots.v;  plots.velocityMps(:)];
     end
-    set(h.marker, 'XData', h.plots.x, 'YData', h.plots.y);
-    if ~isempty(h.labels)
-        delete(h.labels(ishandle(h.labels)));
-    end
-    h.labels = zeros(numel(h.plots.x), 1);
-    for i = 1:numel(h.plots.x)
-        h.labels(i) = text(h.plots.x(i) + 0.012*h.rMax/1e3, h.plots.y(i), ...
-            sprintf('%.0f m/s', h.plots.v(i)), 'Color', [1 0.85 0.2], ...
-            'FontSize', 8, 'Parent', h.ax);
+    age  = h.azAbs - h.plots.az;
+    gone = age >= 360 * max(1, h.P.ppi.trailScans);
+    h.plots.az(gone) = [];  h.plots.x(gone) = [];  h.plots.y(gone) = [];  h.plots.v(gone) = [];
+    age  = age(~gone);
+    cur  = age < 360;                                            % this revolution
+    set(h.marker, 'XData', h.plots.x(cur), 'YData', h.plots.y(cur));
+    set(h.trail,  'XData', h.plots.x(~cur), 'YData', h.plots.y(~cur));
+
+    sig = [nnz(cur); sum(h.plots.az(cur))];
+    if ~isequal(sig, h.labelSig)                                % labels changed
+        for i = 1:numel(h.labels)
+            if ishandle(h.labels{i}), delete(h.labels{i}); end
+        end
+        k = find(cur);
+        h.labels = cell(numel(k), 1);
+        for i = 1:numel(k)
+            h.labels{i} = text(h.plots.x(k(i)) + 0.015*h.rMax/1e3, h.plots.y(k(i)), ...
+                sprintf('%.0f m/s', h.plots.v(k(i))), 'Color', [1 0.85 0.2], ...
+                'FontSize', 9, 'Parent', h.ax);
+        end
+        h.labelSig = sig;
     end
 end
 
