@@ -163,44 +163,58 @@ xlabel('range cell'),ylabel('pulse')
 figure,mesh(10*log10(squeeze(integral_out(pulse_show,:,:)) + eps)),title(sprintf('integral, pulse %d [dB]',pulse_show))
 xlabel('Doppler bin'),ylabel('range cell')
 
-%% CFAR SO
-% Smallest-Of cell-averaging CFAR along RANGE, on every pulse and every Doppler bin.
+%% CFAR OS
+% Ordered-Statistic CFAR along RANGE, on every pulse and on every FFT (Doppler) bin on its own:
+% each bin is a separate range profile and its reference cells come from the same bin only.
 % For the cell under test (CUT) r, with n_guard guard cells and n_ref reference cells on each side:
 %   lead window: r-n_guard-n_ref ... r-n_guard-1      lag window: r+n_guard+1 ... r+n_guard+n_ref
-%   noise = min(mean(lead window), mean(lag window))
+%   the 2*n_ref reference cells are sorted, the n_discard largest are thrown away and the
+%   largest one left is the noise estimate: the k-th smallest cell, k = 2*n_ref - n_discard
 %   detection if integral_out(r) > alpha * noise
-% At the two ends of the range only the window that fits is used.
+% Throwing away the largest cells keeps up to n_discard cells of other targets (or a clutter edge)
+% in the window from raising the threshold.
+% At the two ends of the range only the window that fits is used (n_ref cells, k = n_ref - n_discard,
+% with its own alpha so the Pfa stays the same).
 % After their decoders the short and long parts have different noise levels, so each part gets
 % its own CFAR and no window crosses the switch cell (cfar_part = {1:n_range} for one CFAR).
 % Pulses before first_valid hold the start-up transient of the buffers and are not tested.
 n_guard = 2;                                            % guard cells on each side (must cover the main lobe of the compressed pulse)
 n_ref = 16;                                             % reference cells on each side
+n_discard = 5;                                          % largest reference cells thrown away
 pfa = 1e-6;                                             % probability of false alarm
 cfar_part = {1:n_short,n_short+1:n_range};
 
-% Threshold factor of the SO-CFAR for one square-law look in Gaussian noise (Weiss, 1982):
-%   Pfa(alpha) = 2 * sum_{k=0}^{n_ref-1} nchoosek(n_ref-1+k,k) * (2 + alpha/n_ref)^-(n_ref+k)
+% Threshold factor of the OS-CFAR for one square-law look in Gaussian noise (Rohling, 1983):
+% with N reference cells and the k-th smallest as the noise estimate
+%   Pfa(alpha) = prod_{i=0}^{k-1} (N - i) / (N - i + alpha)
 % The 5 integrated FFTs share 15 of their 16 pulses, so they are far from 5 independent looks;
 % this one-look alpha is close to right and on the safe side (real Pfa a bit lower).
-k = 0:n_ref-1;
-pfa_so = @(a) 2*sum(exp(gammaln(n_ref+k) - gammaln(k+1) - gammaln(n_ref) - (n_ref+k)*log(2 + a/n_ref)));
-alpha = fzero(@(a) log(pfa_so(a)) - log(pfa),[1 1e8]);
-fprintf('CFAR SO: %d guard + %d reference cells per side, Pfa %.0e -> alpha = %.2f dB\n',n_guard,n_ref,pfa,10*log10(alpha));
+pfa_os = @(a,N,k) exp(sum(log(N - (0:k-1)) - log(N - (0:k-1) + a)));
+alpha_both = fzero(@(a) log(pfa_os(a,2*n_ref,2*n_ref - n_discard)) - log(pfa),[1e-3 1e8]);   % both windows
+alpha_one = fzero(@(a) log(pfa_os(a,n_ref,n_ref - n_discard)) - log(pfa),[1e-3 1e8]);        % one window (range ends)
+fprintf('CFAR OS: %d guard + %d reference cells per side, %d largest thrown away (k = %d of %d), Pfa %.0e\n', ...
+        n_guard,n_ref,n_discard,2*n_ref - n_discard,2*n_ref,pfa);
+fprintf('         alpha = %.2f dB (both windows), %.2f dB (one window, k = %d of %d)\n', ...
+        10*log10(alpha_both),10*log10(alpha_one),n_ref - n_discard,n_ref);
 
 cfar_det = false(n_pulse,n_range,n_fft);
 cfar_threshold = nan(n_pulse,n_range,n_fft,class(integral_out));
 for n = first_valid:n_pulse
-    cut = reshape(integral_out(n,:,:),n_range,n_fft);   % range x doppler of this pulse
-    noise = nan(n_range,n_fft);
+    cut = reshape(integral_out(n,:,:),n_range,n_fft);   % range x doppler of this pulse, one column per FFT bin
+    threshold = nan(n_range,n_fft);
     for p = 1:numel(cfar_part)
         cells = cfar_part{p};
-        noise(cells,:) = so_noise(cut(cells,:),n_guard,n_ref);
+        [noise,n_used] = os_noise(cut(cells,:),n_guard,n_ref,n_discard);
+        alpha = nan(numel(cells),1);                    % NaN: no window fits, cell not tested
+        alpha(n_used == 2*n_ref) = alpha_both;
+        alpha(n_used == n_ref) = alpha_one;
+        threshold(cells,:) = alpha.*noise;
     end
-    cfar_threshold(n,:,:) = reshape(alpha*noise,1,n_range,n_fft);
-    cfar_det(n,:,:) = reshape(cut > alpha*noise,1,n_range,n_fft);   % NaN threshold (not tested) gives false
+    cfar_threshold(n,:,:) = reshape(threshold,1,n_range,n_fft);
+    cfar_det(n,:,:) = reshape(cut > threshold,1,n_range,n_fft);     % NaN threshold (not tested) gives false
 end
 cfar_out = integral_out.*cfar_det;                      % integrated value on detections, 0 elsewhere
-fprintf('CFAR SO: %d detections (pulse x range x Doppler bin)\n',nnz(cfar_det));
+fprintf('CFAR OS: %d detections (pulse x range x Doppler bin)\n',nnz(cfar_det));
 
 [p_det,r_det] = find(any(cfar_det,3));
 figure,plot(r_det,p_det,'.'),title('CFAR detections, any Doppler bin')
@@ -218,7 +232,7 @@ figure,plot(10*log10(integral_out(pulse_cfar,:,bin_cfar) + eps)),hold on
 plot(10*log10(cfar_threshold(pulse_cfar,:,bin_cfar)),'r')
 plot(find(cfar_det(pulse_cfar,:,bin_cfar)),10*log10(integral_out(pulse_cfar,cfar_det(pulse_cfar,:,bin_cfar),bin_cfar)),'ko')
 legend('integral','threshold','detection'),xlabel('range cell'),ylabel('dB')
-title(sprintf('CFAR SO, pulse %d, Doppler bin %d',pulse_cfar,bin_cfar))
+title(sprintf('CFAR OS, pulse %d, Doppler bin %d',pulse_cfar,bin_cfar))
 
 %% compare with the radar's lanes
 % The log holds the radar's own output of every block for the same scan. check_lane prints, for
@@ -248,20 +262,30 @@ end
 
 
 %% local functions
-function noise = so_noise(x,n_guard,n_ref)
-% Smallest-Of noise estimate along dim 1 (range) of x (range x doppler):
-%   noise(r,:) = min(mean(x(r-n_guard-n_ref : r-n_guard-1,:)), mean(x(r+n_guard+1 : r+n_guard+n_ref,:)))
-% A window that does not fit inside x is not used; if neither fits, noise is NaN (cell not tested).
-n_cell = size(x,1);
-win_sum = conv2(double(x),ones(n_ref,1));               % row j: sum of x(j-n_ref+1 : j,:), the window that ends at cell j
-lead = nan(size(x));
-lag = nan(size(x));
-r = (1:n_cell).';
-r_lead = r(r - n_guard - 1 >= n_ref);                   % lead window fits: it ends at r-n_guard-1
-r_lag = r(r + n_guard + n_ref <= n_cell);               % lag window fits: it ends at r+n_guard+n_ref
-lead(r_lead,:) = win_sum(r_lead - n_guard - 1,:)/n_ref;
-lag(r_lag,:) = win_sum(r_lag + n_guard + n_ref,:)/n_ref;
-noise = min(lead,lag);                                  % min skips NaN: at the ends the other window is used
+function [noise,n_used] = os_noise(x,n_guard,n_ref,n_discard)
+% Ordered-Statistic noise estimate along dim 1 (range) of x (range x doppler), every column
+% (FFT bin) on its own.
+% Reference cells of the CUT r: lead window r-n_guard-n_ref ... r-n_guard-1 and lag window
+% r+n_guard+1 ... r+n_guard+n_ref; a window that does not fit inside x is not used.
+% The reference cells are sorted, the n_discard largest are thrown away and the largest one left
+% is the noise estimate: the k-th smallest cell, k = n_used - n_discard.
+%   noise    range x doppler, NaN where no window fits (cell not tested)
+%   n_used   range x 1, reference cells used: 2*n_ref, n_ref at the ends of x, or 0
+[n_cell,n_bin] = size(x);
+offset = [-(n_guard+n_ref):-(n_guard+1), (n_guard+1):(n_guard+n_ref)].';   % 2*n_ref x 1: lead window, then lag window
+r = 1:n_cell;
+use = [repmat(r - n_guard - n_ref >= 1,n_ref,1); repmat(r + n_guard + n_ref <= n_cell,n_ref,1)];   % 2*n_ref x n_cell: window fits
+idx = offset + r;                                       % 2*n_ref x n_cell: range cell of every reference cell of every CUT
+idx(~use) = n_cell + 1;                                 % unused reference cells point to a row of NaN
+x = [double(x); nan(1,n_bin)];
+ref = reshape(x(idx,:),2*n_ref,n_cell,n_bin);           % reference cells x range x doppler
+ref = sort(ref,1);                                      % ascending, NaN (unused cells) go to the end
+n_used = sum(use,1).';
+k = n_used - n_discard;                                 % k-th smallest = the largest left after the n_discard largest are thrown away
+noise = nan(n_cell,n_bin);
+ok = find(k >= 1);
+[i_cell,i_bin] = ndgrid(ok,1:n_bin);
+noise(ok,:) = ref(sub2ind(size(ref),repmat(k(ok),1,n_bin),i_cell,i_bin));
 end
 
 function check_lane(mine,radar,name)
