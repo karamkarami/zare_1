@@ -141,77 +141,65 @@ pulse_show = round(n_pulse/2);                          % pulse shown in the ran
 figure,mesh(20*log10(abs(squeeze(fft_out(pulse_show,:,:))) + eps)),title(sprintf('FFT, pulse %d [dB]',pulse_show))
 xlabel('Doppler bin'),ylabel('range cell')
 
-%% non-coherent integration
-% Every FFT output cell (range cell, Doppler bin) has its own 5-deep buffer with the last 5 FFT
-% outputs. The phase is dropped (square-law detector |X|^2) and the 5 powers are summed:
-%   integral_out(n,r,k) = sum_{i=0}^{4} |fft_out(n-i,r,k)|^2
+%% log and non-coherent integration
+% Log detector after the FFT and before the integration. For every FFT output cell, with
+% I = real(fft_out) and Q = imag(fft_out):
+%   fft_db = 10*log10(I^2 + Q^2)                         power in dB
+% This equals 20*log10(abs(fft_out)), but needs no square root.
+% 5*log10(I^2 + Q^2) = 10*log10(abs(fft_out)) is also right as math (log of a square root is half
+% the log), but it is half of the dB value: one unit is 2 dB. The CFAR then finds the same cells
+% if its threshold is halved too: log_scale = 5 with threshold 3 = log_scale = 10 with threshold 6.
+% Every FFT output cell (range cell, Doppler bin) has its own 5-deep buffer with the last 5 log
+% values, and the output is their mean (still in dB; a sum would make the values, and the CFAR
+% threshold, 5 times larger):
+%   integral_out(n,r,k) = 1/5 * sum_{i=0}^{4} fft_db(n-i,r,k)
 % The 5 FFTs slide by one pulse, so one output covers 16 + 5 - 1 = 20 pulses.
-% (For a linear detector use abs(...) instead of abs(...).^2.)
+% A cell that is exactly 0 gives -Inf; this only happens in the start-up transient (not tested).
+log_scale = 10;                                         % 10: dB; 5: your scale (1 unit = 2 dB)
 n_integ = 5;
 integ_buffer = zeros(n_integ,n_range,n_fft,class(canceller_out));
 integral_out = zeros(n_pulse,n_range,n_fft,class(canceller_out));
 for n = 1:n_pulse
-    integ_buffer = cat(1,integ_buffer(2:end,:,:),abs(fft_out(n,:,:)).^2);   % oldest FFT out, newest FFT in
-    integral_out(n,:,:) = sum(integ_buffer,1);
+    fft_db = log_scale*log10(real(fft_out(n,:,:)).^2 + imag(fft_out(n,:,:)).^2);   % 1 x range x doppler, log of I^2+Q^2
+    integ_buffer = cat(1,integ_buffer(2:end,:,:),fft_db);                         % oldest FFT out, newest FFT in
+    integral_out(n,:,:) = sum(integ_buffer,1)/n_integ;                            % mean of the last 5 log values
 end
 
 % first pulse whose buffers hold only valid data: canceller (3) + FFT (16) + integration (5)
 first_valid = length(coef_canceller) + n_fft + n_integ - 2;
 
-figure,mesh(10*log10(max(integral_out,[],3) + eps)),title('integral, max over Doppler bins [dB]')
+figure,mesh(1:n_range,first_valid:n_pulse,max(integral_out(first_valid:end,:,:),[],3)),title('integral, max over Doppler bins [dB]')
 xlabel('range cell'),ylabel('pulse')
-figure,mesh(10*log10(squeeze(integral_out(pulse_show,:,:)) + eps)),title(sprintf('integral, pulse %d [dB]',pulse_show))
+figure,mesh(squeeze(integral_out(pulse_show,:,:))),title(sprintf('integral, pulse %d [dB]',pulse_show))
 xlabel('Doppler bin'),ylabel('range cell')
 
-%% CFAR OS
-% Ordered-Statistic CFAR along RANGE, on every pulse and on every FFT (Doppler) bin on its own:
+%% CFAR
+% CFAR along RANGE on the log (dB) data, on every pulse and on every FFT (Doppler) bin on its own:
 % each bin is a separate range profile and its reference cells come from the same bin only.
 % For the cell under test (CUT) r, with n_guard guard cells and n_ref reference cells on each side:
-%   reference cells: r-n_guard-n_ref ... r-n_guard-1  and  r+n_guard+1 ... r+n_guard+n_ref
-%   1. sort the reference cells (smallest first)
-%   2. throw away the n_discard largest ones
-%   3. noise level of the window = the largest cell that is left
-%   4. threshold = alpha * noise level; detection if integral_out(r) > threshold
-% Throwing away the largest cells keeps up to n_discard cells of other targets (or a clutter edge)
-% in the window from raising the threshold.
-% Near the ends of a part, only the reference cells inside the part are used (fewer cells), and
-% alpha is taken for that number of cells, so the Pfa stays the same.
+%   1. take the two windows together: r-n_guard-n_ref ... r-n_guard-1 and r+n_guard+1 ... r+n_guard+n_ref
+%   2. sort them and throw away the n_discard largest cells (other targets, a clutter edge)
+%   3. noise level = mean of the cells that are left [dB]
+%   4. detection if CUT > noise level + threshold_db, i.e. the CUT is threshold_db above the noise
+% On linear data the threshold is factor * noise; in dB the product becomes a sum, so the
+% threshold is noise level + threshold_db.
+% Near the ends of a part only the reference cells inside the part are used.
 % After their decoders the short and long parts have different noise levels, so each part gets
 % its own CFAR and no window crosses the switch cell (cfar_part = {1:n_range} for one CFAR).
 % Pulses before first_valid hold the start-up transient of the buffers and are not tested.
 n_guard = 2;                                            % guard cells on each side (must cover the main lobe of the compressed pulse)
 n_ref = 16;                                             % reference cells on each side
 n_discard = 5;                                          % largest reference cells thrown away
-pfa = 1e-6;                                             % probability of false alarm
+threshold_db = 16;                                      % CUT must be this far above the noise level (same unit as log_scale)
 cfar_part = {1:n_short,n_short+1:n_range};
-
-% alpha: the factor that turns the noise level into the threshold for the wanted Pfa.
-% Pfa itself is not the multiplier: for N reference cells and the k-th smallest as the noise level
-% (k = N - n_discard), square-law detector and Gaussian noise (Rohling, 1983):
-%   Pfa = prod_{i=0}^{k-1} (N - i) / (N - i + alpha)
-% This Pfa falls when alpha grows, so alpha is found by bisection, for every N that can occur.
-% (The 5 integrated FFTs share 15 of their 16 pulses, so they are close to one look; this alpha
-% is close to right and on the safe side, the real Pfa is a bit lower.)
-alpha = nan(1,2*n_ref);                                 % alpha(N) for N reference cells
-for N = n_discard+1:2*n_ref
-    k = N - n_discard;
-    i = 0:k-1;
-    alpha_low = 0;                                      % Pfa = 1 here (above the wanted Pfa)
-    alpha_high = 1e6;                                   % Pfa far below the wanted Pfa here
-    for iter = 1:100
-        alpha_mid = (alpha_low + alpha_high)/2;
-        pfa_mid = prod((N - i)./(N - i + alpha_mid));
-        if pfa_mid > pfa
-            alpha_low = alpha_mid;                      % too many false alarms: raise alpha
-        else
-            alpha_high = alpha_mid;
-        end
-    end
-    alpha(N) = (alpha_low + alpha_high)/2;
-end
-fprintf('CFAR OS: %d guard + %d reference cells per side, %d largest thrown away, Pfa %.0e\n',n_guard,n_ref,n_discard,pfa);
-fprintf('         alpha = %.2f dB with %d reference cells (k = %d), %.2f dB with %d cells at the ends (k = %d)\n', ...
-        10*log10(alpha(2*n_ref)),2*n_ref,2*n_ref-n_discard,10*log10(alpha(n_ref)),n_ref,n_ref-n_discard);
+% Pfa of this chain measured on noise (white, independent range cells; 1.4e8 cells tested) with
+% n_guard = 2, n_ref = 16, n_discard = 5 (with log_scale = 5 the threshold is half these values):
+%   threshold [dB]   6        8        10       12       14       15       16
+%   Pfa              1.1e-1   3.8e-2   8.1e-3   8.6e-4   3.8e-5   5.6e-6   8.2e-7
+% The threshold is larger than on linear data: the mean of the log values is about 2.5 dB below
+% the mean power, throwing away the largest cells lowers it more, and the 5 integrated FFTs
+% share 15 of their 16 pulses, so they are close to one look. Check the false alarms on a
+% noise-only part of your own data: correlated range cells (oversampled decoder) raise the Pfa.
 
 cfar_det = false(n_pulse,n_range,n_fft);
 cfar_threshold = nan(n_pulse,n_range,n_fft,class(integral_out));
@@ -226,15 +214,17 @@ for p = 1:numel(cfar_part)
         if N <= n_discard
             continue;                                   % too few reference cells: not tested
         end
-        ref = sort(integral_out(pulses,ref_cells,:),2); % pulses x N x doppler, every pulse and bin sorted on its own
-        noise = ref(:,N-n_discard,:);                   % largest cell left after the n_discard largest are thrown away
-        threshold = alpha(N)*noise;                     % pulses x 1 x doppler
+        ref = sort(integral_out(pulses,ref_cells,:),2); % pulses x N x doppler, every pulse and bin sorted on its own, smallest first
+        noise = mean(ref(:,1:N-n_discard,:),2);         % mean of the cells left after the n_discard largest are thrown away
+        threshold = noise + threshold_db;               % pulses x 1 x doppler
         cfar_threshold(pulses,r,:) = threshold;
         cfar_det(pulses,r,:) = integral_out(pulses,r,:) > threshold;
     end
 end
-cfar_out = integral_out.*cfar_det;                      % integrated value on detections, 0 elsewhere
-fprintf('CFAR OS: %d detections (pulse x range x Doppler bin)\n',nnz(cfar_det));
+cfar_out = integral_out;                                % integrated value [dB] on detections, NaN elsewhere
+cfar_out(~cfar_det) = NaN;
+fprintf('CFAR: %d guard + %d reference cells per side, %d largest thrown away, threshold %g\n',n_guard,n_ref,n_discard,threshold_db);
+fprintf('CFAR: %d detections (pulse x range x Doppler bin)\n',nnz(cfar_det));
 
 [p_det,r_det] = find(any(cfar_det,3));
 figure,plot(r_det,p_det,'.'),title('CFAR detections, any Doppler bin')
@@ -242,17 +232,17 @@ xlabel('range cell'),ylabel('pulse'),axis([1 n_range 1 n_pulse])
 
 % CUT and threshold along range at the strongest detection (or the middle pulse, bin 1)
 if any(cfar_det(:))
-    [~,i_max] = max(cfar_out(:));
+    [~,i_max] = max(cfar_out(:));                       % max skips NaN
     [pulse_cfar,~,bin_cfar] = ind2sub(size(cfar_out),i_max);
 else
     pulse_cfar = max(pulse_show,first_valid);
     bin_cfar = 1;
 end
-figure,plot(10*log10(integral_out(pulse_cfar,:,bin_cfar) + eps)),hold on
-plot(10*log10(cfar_threshold(pulse_cfar,:,bin_cfar)),'r')
-plot(find(cfar_det(pulse_cfar,:,bin_cfar)),10*log10(integral_out(pulse_cfar,cfar_det(pulse_cfar,:,bin_cfar),bin_cfar)),'ko')
+figure,plot(integral_out(pulse_cfar,:,bin_cfar)),hold on
+plot(cfar_threshold(pulse_cfar,:,bin_cfar),'r')
+plot(find(cfar_det(pulse_cfar,:,bin_cfar)),integral_out(pulse_cfar,cfar_det(pulse_cfar,:,bin_cfar),bin_cfar),'ko')
 legend('integral','threshold','detection'),xlabel('range cell'),ylabel('dB')
-title(sprintf('CFAR OS, pulse %d, Doppler bin %d',pulse_cfar,bin_cfar))
+title(sprintf('CFAR, pulse %d, Doppler bin %d',pulse_cfar,bin_cfar))
 
 %% compare with the radar's lanes
 % The log holds the radar's own output of every block for the same scan. check_lane prints, for
@@ -269,7 +259,8 @@ if ~isempty(canceler)
     check_lane(canceller_out,canceler,'canceller');
 end
 if ~isempty(integral)
-    check_lane(max(integral_out,[],3),max(integral,[],3),'integral');   % max over bins: Doppler bin order does not matter
+    % max over bins: Doppler bin order does not matter; integral_out is in dB, 10.^(x/log_scale) turns it back to power
+    check_lane(10.^(max(integral_out,[],3)/log_scale),max(integral,[],3),'integral');
 end
 if ~isempty(cfar)
     n_p = min(n_pulse,size(cfar,1));
