@@ -3,6 +3,11 @@
 %   Data  : complex matrix, one row per PRI, one column per range cell.
 %   Steps : load -> noise level -> find the clutter cells -> canceler -> IF -> plots
 %
+%   The IF is only as good as the choice of clutter cells. The script takes every
+%   strong echo near zero Doppler, so a test target (a ring on the PPI), a delay
+%   line or transmitter leakage looks like clutter to it. Check the table of
+%   clutter segments it prints, and set clutterCells / skipCells when needed.
+%
 %   Canceler            y(m) = x(m) - 2 x(m-1) + x(m-2)
 %   Improvement factor  IF = (S/C)out / (S/C)in = G * Cin / Cout
 %                       G = 1^2 + 2^2 + 1^2 = 6 is the canceler gain for noise and
@@ -20,6 +25,8 @@ dataVar      = '';     % variable in the file; '' = the largest numeric variable
 pulsesInRows = true;   % true: rows = PRIs, columns = range cells; false: the opposite
 pris         = [];     % PRIs to use, e.g. 1:300; [] = all
 firstCell    = 1;      % first range cell to use: skip the transmitter leakage / blanking
+clutterCells = [];     % where the clutter is, one [first last] per row, e.g. [1 400]; [] = anywhere
+skipCells    = [];     % cells that are not clutter, e.g. a test target: [990 1110]
 decoderTaps  = [];     % optional decoder taps along range, e.g. conj(fliplr(code)); [] = raw data
 % demo check: [~, dd] = if_demo_data(); decoderTaps = conj(fliplr(dd.long));
 priStep      = 1;      % 1 = cancel consecutive PRIs; 2 = every other PRI
@@ -52,11 +59,11 @@ if ~isempty(pris)
 end
 
 % ADC saturation makes the system nonlinear before any digital processing.
-% Clipped samples pile up at the largest value.
-iq   = abs([real(X(:)); imag(X(:))]);
-nTop = sum(iq >= 0.999 * max(iq));
+% Clipped samples pile up at exactly the same largest (or smallest) value.
+iq   = [real(X(:)); imag(X(:))];
+nTop = max(sum(iq == max(iq)), sum(iq == min(iq)));
 if nTop > 10
-    warning('%d samples sit at the largest value: the ADC is probably saturated, the IF will be limited.', nTop);
+    warning('%d samples sit exactly at the largest value: is the ADC saturated? Then the IF is limited.', nTop);
 end
 
 X     = X(:, firstCell:end);
@@ -87,9 +94,21 @@ fprintf('Noise power %.4g (%.1f dB), DC offset %.1f dB relative to the noise (re
 
 %% 4. Clutter cells -----------------------------------------------------------------
 cnrDb  = 10*log10(max(Pin / noise - 1, eps));            % clutter-to-noise ratio of every cell
-strong = cnrDb >= minCnrDb;
+
+area = true(1, nCell);                                   % where clutter may be
+if ~isempty(clutterCells)
+    area(:) = false;
+    for k = 1:size(clutterCells, 1)
+        area(cells >= clutterCells(k, 1) & cells <= clutterCells(k, 2)) = true;
+    end
+end
+for k = 1:size(skipCells, 1)
+    area(cells >= skipCells(k, 1) & cells <= skipCells(k, 2)) = false;
+end
+
+strong = cnrDb >= minCnrDb & area;
 if ~any(strong)
-    error('No cell is %g dB above the noise. Lower minCnrDb, or check firstCell and the data.', minCnrDb);
+    error('No cell is %g dB above the noise. Lower minCnrDb, or check firstCell, clutterCells and the data.', minCnrDb);
 end
 
 % Correlation of the strong cells from one PRI to the next (lag 1) and two PRIs on
@@ -138,34 +157,71 @@ c   = c & ~odd;
 nCl = sum(c);
 fprintf('%d clutter cells dropped: IF more than %g dB below the median (moving objects)\n', sum(odd), outlierDb);
 
-% Cells far more stable than the rest. At the very start of the range this is
-% transmitter leakage, which makes the IF look too good: move firstCell past it.
+% Cells far more stable than the rest: transmitter leakage, a test target or a
+% delay line. They are not clutter and make the IF look too good.
 stable = c & 10*log10(G * Pin ./ Pout) > median(ifCellDb(c & ~isnan(ifCellDb))) + outlierDb;
 if any(stable)
     fprintf('Note: %d cells between cells %d and %d are far more stable than the rest.\n', ...
             sum(stable), min(cells(stable)), max(cells(stable)));
-    fprintf('      If they are at the start of the range (transmitter leakage), set firstCell after them.\n');
+    fprintf('      Transmitter leakage, a test target, a delay line? If so, leave them out (skipCells).\n');
 end
 
-ifLowDb = 10*log10(G * sum(Pin(c)) / sum(Pout(c)));      % noise not removed: a lower bound
-residue = sum(Cout(c)) / (G * noise * nCl);              % clutter left / noise, at the output
+% IF of a group of cells m (true/false mask or indices)
+ifOf  = @(m) 10*log10(G * sum(Cin(m)) / sum(Cout(m)));  % noise removed
+lowOf = @(m) 10*log10(G * sum(Pin(m)) / sum(Pout(m)));  % noise not removed: a lower bound
+okOf  = @(m) sum(Cout(m)) > 0.1 * G * noise * sum(m > 0);   % clutter left is above 10 % of the noise
+
+% Clutter segments: neighbouring clutter cells (gaps up to 3 cells). The total IF
+% is weighted by power, so the strongest segment sets it.
+idx   = find(c);
+brk   = [0, find(diff(idx) > 3), numel(idx)];
+nSeg  = numel(brk) - 1;
+seg   = cell(nSeg, 1);
+share = zeros(nSeg, 1);
+for k = 1:nSeg
+    seg{k}   = idx(brk(k)+1 : brk(k+1));
+    share(k) = sum(Cin(seg{k})) / sum(Cin(c));
+end
+[~, order] = sort(share, 'descend');
+fprintf('\nClutter segments, strongest first:\n');
+fprintf('     cells        max CNR   power share      IF\n');
+for k = order(1:min(8, nSeg))'
+    m = seg{k};
+    if okOf(m)
+        ifTxt = sprintf('   %5.1f dB', ifOf(m));
+    else
+        ifTxt = sprintf('>= %5.1f dB', lowOf(m));
+    end
+    fprintf('  %5d - %-5d  %5.1f dB  %8.1f %%   %s\n', cells(m(1)), cells(m(end)), max(cnrDb(m)), 100 * share(k), ifTxt);
+end
+if nSeg > 8
+    fprintf('  (+ %d smaller segments)\n', nSeg - 8);
+end
 
 fprintf('\n');
-if residue > 0.1
-    caDb = 10*log10(sum(Cin(c)) / sum(Cout(c)));
-    ifDb = caDb + 10*log10(G);
+if okOf(c)
+    caDb = ifOf(c) - 10*log10(G);
+    ifDb = ifOf(c);
     fprintf('Clutter attenuation  CA = %.1f dB\n', caDb);
     fprintf('Improvement factor   IF = CA + 10log10(%d) = %.1f dB   (%d clutter cells)\n', G, ifDb, nCl);
-    fprintf('(without noise removal IF = %.1f dB, a lower bound)\n', ifLowDb);
+    fprintf('(without noise removal IF = %.1f dB, a lower bound)\n', lowOf(c));
 else
-    ifDb = ifLowDb;
-    fprintf('Improvement factor   IF >= %.1f dB\n', ifLowDb);
+    ifDb = lowOf(c);
+    fprintf('Improvement factor   IF >= %.1f dB\n', ifDb);
     fprintf('The clutter left after the canceler is below the noise, so only a lower bound\n');
     fprintf('can be measured. Use stronger clutter cells (raise minCnrDb).\n');
 end
-fprintf('IF of single clutter cells: median %.1f dB\n', median(ifCellDb(c & ~isnan(ifCellDb))));
+ifMedDb = median(ifCellDb(c & ~isnan(ifCellDb)));
+fprintf('IF of single clutter cells: median %.1f dB\n', ifMedDb);
+if ifDb > ifMedDb + 6
+    k = order(1);
+    fprintf('\nThe total IF is far above the typical cell: it is set by the strongest segment,\n');
+    fprintf('cells %d-%d (%.0f %% of the clutter power). If that is not ground clutter\n', ...
+            cells(seg{k}(1)), cells(seg{k}(end)), 100 * share(k));
+    fprintf('(test target, delay line, leakage), leave it out with skipCells.\n');
+end
 if exist('demo', 'var')
-    fprintf('Demo: true IF of the simulated clutter = %.1f dB\n', demo.ifDb);
+    fprintf('Demo: true IF of the clutter %.1f dB, of the test target (cell 1000) %.1f dB\n', demo.ifDb, demo.testIfDb);
 end
 
 %% 7. Plots -------------------------------------------------------------------------
