@@ -20,7 +20,10 @@ returned so it can be compared with the matching MCPS log lane (`decoder`, `canc
    margin of every target over the CFAR threshold). It then simulates two revolutions while
    the PPI sweep turns at the antenna speed. Finally it prints every target echo against its
    plot and replays the revolutions in real time.
-4. **Self-test:** run `rsp_selftest` (45 checks).
+4. **Improvement factor of the MTI:** run `main_if` on a few hundred consecutive pulses of
+   raw video. The clutter does not have to be located by hand (see
+   [Improvement factor](#improvement-factor-main_if)).
+5. **Self-test:** run `rsp_selftest` (52 checks).
 
 ### Test scenario (`main_scan`)
 
@@ -163,6 +166,79 @@ antenna speed.
   canceler + Doppler-bin filter at the target's Doppler) and the margin over the actual CFAR
   threshold. It agrees with the simulated margins within about 1 dB.
 
+## Improvement factor (`main_if`)
+
+`rsp_improvement_factor(video, P)` measures the MTI improvement factor on recorded clutter. It
+uses the IEEE definition: the S/C ratio after the clutter filter over the S/C ratio before it,
+averaged over all target velocities. Averaged over velocity, a target gets the filter's noise
+gain G = Σ|w|², so
+
+```
+I = G · Cin / Cout = CNR before the canceler / CNR after it
+```
+
+Only the noise level is needed, not the position of the clutter:
+
+1. **Decoding:** the raw video is decoded with both pulses (`rsp_matched_filter`), so the
+   clutter is measured with the pulse compression gain. Use `'input', 'decoded'` for a decoder
+   lane, or `'samples'` if the codes are not known.
+2. **Noise cells:** cells with no pulse-to-pulse correlation (|ρ(1)| < 3/√pulses). The noise is
+   their median power.
+3. **Clutter cells:** CNR ≥ `minCnrDb` (10 dB) and a mean velocity within ±`maxVelocityMps`
+   (5 m/s). Some cells hold a moving echo that passes the canceler or one of the Doppler bins.
+   That cell and its neighbours within the range resolution are left out. A strong fixed echo
+   is kept.
+4. **Results:** I is given for
+   * all clutter cells together (summed powers);
+   * each pulse zone (short pulse near the radar, long pulse beyond the switch cell);
+   * each range cell;
+   * 2-, 3- and 4-pulse cancelers on the same clutter;
+   * every Doppler bin of the canceler + FFT, both averaged over velocity and with the target
+     at the bin's peak (this one includes the coherent gain).
+5. **Clutter figures:** the CNR, ρ(1) and spectral spread [m/s] of the clutter. It also gives
+   the limit set by the antenna scan alone (Gaussian beam, `beamwidthDeg`, `rpm`, PRF).
+
+**Measurement floor:** the residue is measured against the noise. Its estimate has a spread
+that falls with the number of pulses and cells. A residue below 3 standard deviations cannot
+be told from zero. I is then printed as a lower bound (`> 47.3 dB`), and `maxDb` gives the
+highest I that the data can show.
+
+The function and `main_if` were checked on simulated clutter: a Gaussian spectrum of 2 m/s up
+to 12 km, CNR about 50 dB, and a 20 m/s target inside it.
+
+| Filter | Theory (w'w / w'Rw) | Measured |
+|---|---|---|
+| 2-pulse | 29.0 dB | 28.9 dB |
+| 3-pulse (the chain) | 55.0 dB | 54.8 dB (short pulse zone 54.9 dB) |
+| 4-pulse | 79.2 dB | > 67.0 dB (bound: the residue is below the noise) |
+| Doppler bins 2 / 3 | 31.0 / 58.5 dB | 31.0 / 58.9 dB |
+
+The target cell is left out. Without that, the target lowers bin 3 by 4 dB.
+
+```matlab
+IF = rsp_improvement_factor(video, P);                        % raw video, all valid cells
+IF = rsp_improvement_factor(video, P, 'cells', [70 800]);     % only the clutter area
+IF = rsp_improvement_factor(video, P, 'noiseCells', [3000 5000]);   % a known clutter-free range
+```
+
+![Improvement factor](docs/improvement_factor.png)
+
+The figure has four panels:
+* **Power vs range:** clutter cells in red, the canceler output divided by G in blue.
+* **I per cell:** lower bounds are triangles; the lines are the pulse zones.
+* **Mean Doppler spectrum:** the clutter before and after the canceler.
+* **I of every Doppler bin.**
+
+In this example, the long-pulse zone (beyond 16.9 km) also holds clutter. It is the range
+sidelobes of the long pulse, from the clutter close to the radar. There the CNR is too low to
+measure more than 45 dB.
+
+Notes:
+* **Noise level:** the noise must be the same in the clutter and noise cells. If your
+  receiver uses STC, give the noise per cell (`'noise'`, one value per range cell).
+* **No noise cells found:** a DC offset in the raw I/Q, for example, makes every cell
+  correlated from pulse to pulse. Then give `'noiseCells'` or `'noise'`.
+
 ## Comparing with your log (`main_rsp`)
 
 * **a)** The full chain from video is compared with every log lane.
@@ -178,6 +254,7 @@ lanes it reports matched, missed and extra detections.
 | `radar_params.m` | **your radar's values** |
 | `rsp_default_params.m` | every parameter with documentation |
 | `main_rsp.m`, `main_scan.m` | log data and comparison / simulated rotating radar with PPI |
+| `main_if.m`, `rsp_improvement_factor.m` | MTI improvement factor measured on recorded clutter |
 | `rsp_chain.m` | the whole chain for one block |
 | `rsp_waveform.m`, `rsp_decoder.m`, `rsp_code.m`, `rsp_code_mmf.m`, `rsp_window.m` | pulses, codes, decoders |
 | `rsp_matched_filter.m` | pulse compression, alignment, stitching |

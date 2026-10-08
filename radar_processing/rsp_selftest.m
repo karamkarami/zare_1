@@ -18,6 +18,10 @@ function ok = rsp_selftest()
 %                         azimuth and velocity, CFAR margin as budgeted; Pfa
 %                         on noise; block size independence
 %   9. rsp_compare      : finds a known shift and gain
+%  10. improvement factor: clutter with a known spectrum and a moving target in
+%                         it: noise, clutter cells, I of 2/3/4-pulse cancelers
+%                         and of every Doppler bin against w'w / w'Rw, the
+%                         measurement floor, bin taps against a direct build
 
 rng(7);
 ok = true;
@@ -245,6 +249,49 @@ ok = check(ok, sprintf('compare: shift [%d %d], gain %.2f dB', r.lag, r.gainDb),
            isequal(r.lag, [2 5]) && abs(r.gainDb - 20*log10(2)) < 0.01 && r.corr > 0.999);
 r = rsp_compare(out.cfar.map, out.cfar.det, 'cfar', 'quiet', true, 'align', false);
 ok = check(ok, 'compare: identical detection maps', r.missed == 0 && r.extra == 0);
+
+%% 10. Improvement factor -------------------------------------------------------------------
+% Clutter up to 12 km with a Gaussian spectrum (2 m/s, no texture) and a 20 m/s
+% target inside it. The clutter correlation is rho(k) = exp(-2 pi^2 sf^2 k^2),
+% so any slow-time filter h has I = h'h / h'Rh.
+Si = struct('nRange', 2500, 'noiseDb', 0, 'blankTx', true, 'seed', 11);
+Si.targets = struct('rangeM', 8000, 'azDeg', 4, 'velocityMps', 20, 'powerDb', 10);
+Si.clutter = struct('powerDb', 60, 'maxRangeM', 12000, 'sigmaVMps', 2, 'textureDb', 0);
+IF = rsp_improvement_factor(rsp_simulate(P, Si, (1:500)'), P, 'plot', false, 'quiet', true);
+g  = rsp_geometry(P, Si.nRange);
+sf = 2 * Si.clutter.sigmaVMps / g.lambdaM / P.radar.prfHz;
+th = @(h) 10*log10(real(h(:)' * h(:)) / ...
+          real(h(:)' * toeplitz(exp(-2*pi^2 * sf^2 * (0:numel(h)-1).^2)) * h(:)));
+ok = check(ok, sprintf('improvement factor: noise %.2f dB (0)', 10*log10(IF.noise(1))), ...
+           abs(10*log10(IF.noise(1))) < 0.1);
+tgt = round(8000 / g.cellM) + 1;
+ok = check(ok, sprintf('improvement factor: %d clutter cells up to %.1f km, target cell %d left out', ...
+           IF.clutter.nCells, IF.clutter.rangeKm(2), tgt), IF.clutter.nCells > 600 && ...
+           ~IF.cell.clutter(IF.cells == tgt));
+io = [IF.orders(1:2).iDb];
+it = [th([1 -1]) th([1 -2 1])];
+ok = check(ok, sprintf('improvement factor: 2-/3-pulse canceler %.1f / %.1f dB (theory %.1f / %.1f)', ...
+           io, it), all(abs(io - it) < 0.5) && ~any([IF.orders(1:2).bound]));
+ok = check(ok, sprintf('improvement factor: 4-pulse > %.1f dB, a bound below theory %.1f dB', ...
+           IF.orders(3).iDb, th([1 -3 3 -1])), IF.orders(3).bound && IF.orders(3).iDb < th([1 -3 3 -1]));
+tb = zeros(1, size(IF.bins.taps, 2));
+for k = 1:numel(tb)
+    tb(k) = th(IF.bins.taps(:, k));
+end
+m = ~IF.bins.bound;
+ok = check(ok, sprintf(['improvement factor: %d Doppler bins within %.2f dB of theory, ' ...
+           'the other %d are bounds below it'], nnz(m), max(abs(IF.bins.iDb(m) - tb(m))), nnz(~m)), ...
+           nnz(m) >= 3 && max(abs(IF.bins.iDb(m) - tb(m))) < 1 && all(IF.bins.iDb(~m) < tb(~m)));
+w   = rsp_canceler_taps(P.canceler);
+n   = (0:P.fft.nPulses-1)';
+v   = rsp_window(P.fft.window, P.fft.nPulses) .* exp(-1j*2*pi*2*n/P.fft.nfft);    % bin 3
+ok = check(ok, 'improvement factor: bin taps = canceler * window * DFT', ...
+           relErr(conv(flipud(v), w(:)), IF.bins.taps(:, 3)) < 1e-12);
+Si.clutter.powerDb = 30;                            % weak clutter: CNR about 20 dB
+IF = rsp_improvement_factor(rsp_simulate(P, Si, (1:500)'), P, 'plot', false, 'quiet', true);
+ok = check(ok, sprintf(['improvement factor: weak clutter, 3-pulse > %.1f dB (a bound), ' ...
+           '2-pulse %.1f dB'], IF.canceler.iDb, IF.orders(1).iDb), IF.canceler.bound && ...
+           IF.canceler.iDb < it(2) && abs(IF.orders(1).iDb - it(1)) < 0.5);
 
 if ok
     fprintf('ALL TESTS PASSED\n');
