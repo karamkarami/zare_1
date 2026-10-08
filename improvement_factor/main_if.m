@@ -4,9 +4,11 @@
 %   Steps : load -> noise level -> find the clutter cells -> canceler -> IF -> plots
 %
 %   The IF is only as good as the choice of clutter cells. The script takes every
-%   strong echo near zero Doppler, so a test target (a ring on the PPI), a delay
-%   line or transmitter leakage looks like clutter to it. Check the table of
-%   clutter segments it prints, and set clutterCells / skipCells when needed.
+%   strong echo near zero Doppler: ground clutter, but also a test target (a ring on
+%   the PPI), a delay line or transmitter leakage. Check the table of clutter
+%   segments it prints, and choose the cells with clutterCells / skipCells.
+%   A steady test target is a good "clutter" for the IF of the radar itself: it
+%   does not move, so all that the canceler leaves of it comes from the radar.
 %
 %   Canceler            y(m) = x(m) - 2 x(m-1) + x(m-2)
 %   Improvement factor  IF = (S/C)out / (S/C)in = G * Cin / Cout
@@ -137,7 +139,8 @@ fprintf('Clutter cells: %d between cells %d and %d, median CNR %.1f dB (%d stron
 
 %% 5. 3-pulse canceler --------------------------------------------------------------
 w    = [1 -2 1];
-Y    = w(1) * X(1+2*s:end, :) + w(2) * X(1+s:end-s, :) + w(3) * X(1:end-2*s, :);
+canc = @(Z) w(1) * Z(1+2*s:end, :) + w(2) * Z(1+s:end-s, :) + w(3) * Z(1:end-2*s, :);
+Y    = canc(X);
 G    = sum(abs(w).^2);                                   % = 6
 Pout = mean(abs(Y).^2, 1);
 
@@ -157,19 +160,44 @@ c   = c & ~odd;
 nCl = sum(c);
 fprintf('%d clutter cells dropped: IF more than %g dB below the median (moving objects)\n', sum(odd), outlierDb);
 
-% Cells far more stable than the rest: transmitter leakage, a test target or a
-% delay line. They are not clutter and make the IF look too good.
+% Cells far more stable than the rest: a test target, a delay line or leakage
 stable = c & 10*log10(G * Pin ./ Pout) > median(ifCellDb(c & ~isnan(ifCellDb))) + outlierDb;
 if any(stable)
-    fprintf('Note: %d cells between cells %d and %d are far more stable than the rest.\n', ...
+    fprintf('Note: %d cells between cells %d and %d are far more stable than the rest\n', ...
             sum(stable), min(cells(stable)), max(cells(stable)));
-    fprintf('      Transmitter leakage, a test target, a delay line? If so, leave them out (skipCells).\n');
+    fprintf('      (test target, delay line, transmitter leakage?).\n');
 end
 
-% IF of a group of cells m (true/false mask or indices)
-ifOf  = @(m) 10*log10(G * sum(Cin(m)) / sum(Cout(m)));  % noise removed
-lowOf = @(m) 10*log10(G * sum(Pin(m)) / sum(Pout(m)));  % noise not removed: a lower bound
-okOf  = @(m) sum(Cout(m)) > 0.1 * G * noise * sum(m > 0);   % clutter left is above 10 % of the noise
+% IF of a group of cells m (true/false mask or indices) from an output power P
+% whose noise part is Pn in every cell: with the noise removed (ifOf), or without
+% removing it (lowOf, a lower bound). okOf: the clutter left is above 10 % of the noise.
+nOf   = @(m) sum(m > 0);
+ifOf  = @(m, P, Pn) 10*log10(G * sum(Cin(m)) / max(sum(P(m)) - Pn * nOf(m), eps));
+lowOf = @(m, P)     10*log10(G * sum(Pin(m)) / sum(P(m)));
+okOf  = @(m, P, Pn) sum(P(m)) - Pn * nOf(m) > 0.1 * Pn * nOf(m);
+
+% Steady echo of every cell: the same echo in every PRI, turning with a constant
+% Doppler (phase step angle(R1) from one PRI to the next). It is the mean over the
+% PRIs after the Doppler is taken out. For a test target nearly all of the power
+% is steady, for moving ground clutter only a little.
+ref = zeros(size(X));
+for q = 1:s                                              % with priStep = 2: each pulse alone
+    rows = q:s:nPri;
+    rot  = exp(1j * (0:numel(rows)-1)' * angle(R1));
+    ref(rows, :) = mean(X(rows, :) .* conj(rot), 1) .* rot;
+end
+steadyOf = @(m) sum(sum(abs(ref(:, m)).^2)) / (nPri * sum(Pin(m)));
+
+% What the canceler leaves of a steady echo, in three parts:
+%   Doppler   : the canceler output of the steady echo itself (its constant Doppler)
+%   amplitude : the changes from pulse to pulse in phase with the echo
+%   phase     : the changes at 90 degrees to the echo (phase noise, timing jitter)
+% The last two each carry half of the output noise.
+Yd    = canc(X - ref);                                   % canceler output of the changes
+u     = ref(1+s:end-s, :) ./ abs(ref(1+s:end-s, :));     % phase of the steady echo
+PoutD = mean(abs(canc(ref)).^2, 1);                      % Doppler part
+PoutA = mean(real(Yd .* conj(u)).^2, 1);                 % amplitude part
+PoutP = mean(imag(Yd .* conj(u)).^2, 1);                 % phase part
 
 % Clutter segments: neighbouring clutter cells (gaps up to 3 cells). The total IF
 % is weighted by power, so the strongest segment sets it.
@@ -183,30 +211,54 @@ for k = 1:nSeg
     share(k) = sum(Cin(seg{k})) / sum(Cin(c));
 end
 [~, order] = sort(share, 'descend');
+shown = order(1:min(8, nSeg))';
 fprintf('\nClutter segments, strongest first:\n');
-fprintf('     cells        max CNR   power share      IF\n');
-for k = order(1:min(8, nSeg))'
+fprintf('     cells        max CNR   power share   steady       IF\n');
+for k = shown
     m = seg{k};
-    if okOf(m)
-        ifTxt = sprintf('   %5.1f dB', ifOf(m));
+    if okOf(m, Pout, G * noise)
+        ifTxt = sprintf('   %5.1f dB', ifOf(m, Pout, G * noise));
     else
-        ifTxt = sprintf('>= %5.1f dB', lowOf(m));
+        ifTxt = sprintf('>= %5.1f dB', lowOf(m, Pout));
     end
-    fprintf('  %5d - %-5d  %5.1f dB  %8.1f %%   %s\n', cells(m(1)), cells(m(end)), max(cnrDb(m)), 100 * share(k), ifTxt);
+    fprintf('  %5d - %-5d  %5.1f dB  %8.1f %%   %5.1f %%   %s\n', cells(m(1)), cells(m(end)), ...
+            max(cnrDb(m)), 100 * share(k), 100 * steadyOf(m), ifTxt);
 end
 if nSeg > 8
     fprintf('  (+ %d smaller segments)\n', nSeg - 8);
 end
 
+% Steady segments (test target, delay line): the IF that each part alone would
+% give. 1/IF = 1/IFdoppler + 1/IFamplitude + 1/IFphase. A test target that is not
+% locked to the radar has a small Doppler f, which alone limits the IF to
+% 6 / (16 sin^4(pi f)).
+shownSteady = shown(cellfun(steadyOf, seg(shown)) > 0.9);
+if ~isempty(shownSteady)
+    fprintf('\nSteady segments (more than 90 %% of the power is the same echo in every PRI):\n');
+    fprintf('     cells       Doppler/PRF    Doppler part  amplitude part    phase part\n');
+    for k = shownSteady
+        m   = seg{k};
+        txt = sprintf('     %6.1f dB', min(10*log10(G * sum(Cin(m)) / sum(PoutD(m))), 999.9));
+        for P = {PoutA, PoutP}
+            if okOf(m, P{1}, G * noise / 2)
+                txt = [txt, sprintf('      %5.1f dB', ifOf(m, P{1}, G * noise / 2))];
+            else
+                txt = [txt, sprintf('   >= %5.1f dB', lowOf(m, P{1}))];
+            end
+        end
+        fprintf('  %5d - %-5d   %+9.6f %s\n', cells(m(1)), cells(m(end)), angle(sum(R1(m))) / (2*pi), txt);
+    end
+end
+
 fprintf('\n');
-if okOf(c)
-    caDb = ifOf(c) - 10*log10(G);
-    ifDb = ifOf(c);
+if okOf(c, Pout, G * noise)
+    ifDb = ifOf(c, Pout, G * noise);
+    caDb = ifDb - 10*log10(G);
     fprintf('Clutter attenuation  CA = %.1f dB\n', caDb);
     fprintf('Improvement factor   IF = CA + 10log10(%d) = %.1f dB   (%d clutter cells)\n', G, ifDb, nCl);
-    fprintf('(without noise removal IF = %.1f dB, a lower bound)\n', lowOf(c));
+    fprintf('(without noise removal IF = %.1f dB, a lower bound)\n', lowOf(c, Pout));
 else
-    ifDb = lowOf(c);
+    ifDb = lowOf(c, Pout);
     fprintf('Improvement factor   IF >= %.1f dB\n', ifDb);
     fprintf('The clutter left after the canceler is below the noise, so only a lower bound\n');
     fprintf('can be measured. Use stronger clutter cells (raise minCnrDb).\n');
@@ -216,9 +268,9 @@ fprintf('IF of single clutter cells: median %.1f dB\n', ifMedDb);
 if ifDb > ifMedDb + 6
     k = order(1);
     fprintf('\nThe total IF is far above the typical cell: it is set by the strongest segment,\n');
-    fprintf('cells %d-%d (%.0f %% of the clutter power). If that is not ground clutter\n', ...
+    fprintf('cells %d-%d (%.0f %% of the clutter power). To measure on ground clutter, leave\n', ...
             cells(seg{k}(1)), cells(seg{k}(end)), 100 * share(k));
-    fprintf('(test target, delay line, leakage), leave it out with skipCells.\n');
+    fprintf('it out with skipCells; to measure on that echo alone, set clutterCells to it.\n');
 end
 if exist('demo', 'var')
     fprintf('Demo: true IF of the clutter %.1f dB, of the test target (cell 1000) %.1f dB\n', demo.ifDb, demo.testIfDb);
