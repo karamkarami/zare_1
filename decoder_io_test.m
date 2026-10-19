@@ -5,12 +5,19 @@ close all
 %% ============================ PARAMETERS ============================
 fs = 2e6;                
 c  = 3e8;             
-noise_on = true;         
-rng(1);                   
+noise_on = true;
+rng(1);
+
+% ----------------------------- fixed point -----------------------------
+% decoder input  : int16 (complex), one ADC scale for the whole PRI
+% decoder taps   : int16, final FIR taps (window / flip / conj already applied), scaled to full range
+% decoder output : int32 = (full-precision accumulator) >> out_shift, out_shift from worst-case growth
+adc_peak = [];            % input amplitude mapped to int16 full scale ([] = peak of rx in the PRI)
 
 % ----------------------------- short pulse -----------------------------
 sp.type = 'phase';        % 'phase' or 'lfm'
-sp.code     = [1 -1 1 -1 1 1 -1 -1 -1 1 1 -1 -1 1 -1 -1 1 1 1 1 1];      
+sp.chip_us  = 1;          % chip width [us] -> round(chip_us*1e-6*fs) samples per chip
+sp.code     = [1 -1 1 -1 1 1 -1 -1 -1 1 1 -1 -1 1 -1 -1 1 1 1 1 1];
 mmf = [-0.170847936550266;
 0.006480974129943;
 0.021239501875478;
@@ -74,8 +81,9 @@ mmf = [-0.170847936550266;
 -0.021239501875479;
 0.006480974129943;
 0.170847936550266];
-% mmf = repelem(mmf,2);
-sp.mismatch = (mmf);                              
+sp.mismatch = mmf;        % one tap per chip (3 x code length); repeated to samples per chip internally
+sp.mismatch_form = 'correlator';   % 'correlator': taps in code order (y = xcorr(x, taps))
+                                   % 'impulse'   : taps already are the FIR impulse response (y = conv(x, taps))
 sp.lfm_T  = 100e-6;        % pulse width [s]
 sp.lfm_B  = 1e6;          % sweep bandwidth [Hz]
 sp.window = 'none';     % 'taylor', 'hamming' or 'none'
@@ -91,8 +99,10 @@ sp.target_doppler_hz = 0;
 gap_mid_us = 30;           % gap2: end of short listening -> long TX starts [us]
 
 lp.type = 'lfm';        % 'phase' or 'lfm'
-lp.code     = kron([1 1 1 -1 1], [1 1 1 1 1 -1 -1 1 1 -1 1 -1 1]);   
-lp.mismatch = [];                                  
+lp.chip_us  = 1;
+lp.code     = kron([1 1 1 -1 1], [1 1 1 1 1 -1 -1 1 1 -1 1 -1 1]);
+lp.mismatch = [];
+lp.mismatch_form = 'correlator';
 lp.lfm_T  = 100e-6;
 lp.lfm_B  = 1e6;
 lp.window = 'taylor';
@@ -136,47 +146,84 @@ listening(sp.win_start + (1:sp.win_len)) = true;
 listening(lp.win_start + (1:lp.win_len)) = true;
 rx(~listening) = 0;                       % receiver is off outside the listening windows
 
-dec_in_short  = rx(sp.win_start + (1:sp.win_len));
-dec_in_long   = rx(lp.win_start + (1:lp.win_len));
-dec_out_short = decoder(dec_in_short, sp.h);
-dec_out_long  = decoder(dec_in_long,  lp.h);
+% ---------------- fixed point: int16 input, int16 taps, int32 output ----------------
+if isempty(adc_peak), adc_peak = max(abs([real(rx), imag(rx)])); end
+in_scale = double(intmax('int16')) / adc_peak;           % rx units -> int16 counts
+[sp.hq, sp.h_scale, sp.out_shift] = quantize_filter(sp.h);
+[lp.hq, lp.h_scale, lp.out_shift] = quantize_filter(lp.h);
 
-h_short = sp.h;   tx_short = sp.tx;
-h_long  = lp.h;   tx_long  = lp.tx;
+dec_in_short  = int16(rx(sp.win_start + (1:sp.win_len)) * in_scale);
+dec_in_long   = int16(rx(lp.win_start + (1:lp.win_len)) * in_scale);
+dec_out_short = decoder(dec_in_short, sp.hq, sp.out_shift);
+dec_out_long  = decoder(dec_in_long,  lp.hq, lp.out_shift);
+
+h_short = sp.hq;  h_scale_short = sp.h_scale;  out_shift_short = sp.out_shift;  delay_short = sp.filter_delay;
+h_long  = lp.hq;  h_scale_long  = lp.h_scale;  out_shift_long  = lp.out_shift;  delay_long  = lp.filter_delay;
+tx_short = sp.tx;  tx_long = lp.tx;
 save('decoder_io.mat', 'dec_in_short', 'dec_out_short', 'dec_in_long', 'dec_out_long', ...
-     'h_short', 'h_long', 'tx_short', 'tx_long', 'fs');
+     'h_short', 'h_long', 'h_scale_short', 'h_scale_long', 'out_shift_short', 'out_shift_long', ...
+     'delay_short', 'delay_long', 'in_scale', 'tx_short', 'tx_long', 'fs');
+
+fprintf('Fixed point: input int16 (scale %.2f counts/unit) | taps int16 | output int32\n', in_scale);
+fprintf('   short: %d taps, tap scale %.1f, output shift %d\n', numel(sp.hq), sp.h_scale, sp.out_shift);
+fprintf('   long : %d taps, tap scale %.1f, output shift %d\n\n', numel(lp.hq), lp.h_scale, lp.out_shift);
+
+% back to rx units (noise power 1) for checks and plots
+x_short = double(dec_in_short) / in_scale;
+x_long  = double(dec_in_long)  / in_scale;
+y_short = double(dec_out_short) * 2^sp.out_shift / (in_scale * sp.h_scale);
+y_long  = double(dec_out_long)  * 2^lp.out_shift / (in_scale * lp.h_scale);
 
 %% =================== 5) Check peaks and plot ===================
-check_peak(dec_out_short, sp, fs, c, noise_on);
-check_peak(dec_out_long,  lp, fs, c, noise_on);
-plot_results(rx, sp, lp, dec_in_short, dec_out_short, dec_in_long, dec_out_long, fs, c);
+check_peak(y_short, sp, fs, c, noise_on);
+check_peak(y_long,  lp, fs, c, noise_on);
+plot_results(rx, sp, lp, x_short, y_short, x_long, y_long, fs, c);
 
 
 %% ============================ FUNCTIONS ============================
-function y = decoder(x, h)
-% DECODER BLOCK under test: FIR filter with taps h (full convolution).
+function y = decoder(x, h, out_shift)
+% DECODER BLOCK under test: FIR filter y(n) = sum_k h(k) x(n-k+1) (full convolution).
+% x: int16 input, h: int16 final taps, y: int32 = accumulator >> out_shift (rounded, saturated).
 % length(y) = length(x) + length(h) - 1. The peak of an echo that starts at
 % input sample k appears at output sample k + filter_delay.
-    y = conv(x, flip(h));
+    acc = conv(double(x), double(h));                  % exact: all values are integers < 2^53
+    y   = int32(acc / 2^out_shift);
+end
+
+function [hq, scale, out_shift] = quantize_filter(h)
+% Final taps -> int16 (largest real/imag part = 32767), and the output shift that
+% keeps the worst-case accumulator (|input| = 32768 on every tap) inside int32.
+    scale = double(intmax('int16')) / max(abs([real(h), imag(h)]));
+    hq    = int16(h * scale);
+    hd    = double(hq);
+    acc_max   = 32768 * sum(abs(real(hd)) + abs(imag(hd)));
+    out_shift = max(0, ceil(log2(acc_max / double(intmax('int32')))));
 end
 
 function [tx, h, delay] = make_pulse_and_filter(p, fs)
-% Builds the transmitted baseband pulse and the decoder coefficients.
+% Builds the transmitted baseband pulse and the final decoder taps h
+% (window, flip and conj already applied: the decoder only does conv(x, h)).
     switch p.type
         case 'phase'
-            tx = p.code(:).';                                   % one sample per chip
+            spc  = round(p.chip_us*1e-6*fs);                    % samples per chip
+            code = p.code(:).';
+            tx   = repelem(code, spc);
             if isempty(p.mismatch)
-                h = ls_mismatch_filter(tx, 3*numel(tx));        % placeholder until you insert yours
+                h_chip = ls_mismatch_filter(code, 3*numel(code));   % placeholder until you insert yours
             else
-                h = p.mismatch(:).';
+                h_chip = p.mismatch(:).';
+                if strcmp(p.mismatch_form, 'correlator')
+                    h_chip = conj(fliplr(h_chip));              % correlator taps -> impulse response
+                end
             end
-            if numel(h) ~= 3*numel(tx)
+            if numel(h_chip) ~= 3*numel(code)
                 warning('%s: mismatch filter has %d taps, expected 3*%d = %d.', ...
-                        p.name, numel(h), numel(tx), 3*numel(tx));
+                        p.name, numel(h_chip), numel(code), 3*numel(code));
             end
-            if max(abs(conv(tx, conj(fliplr(h))))) > 2*max(abs(conv(tx, h)))
-                warning('%s: mismatch taps look time-reversed. Use h = conj(fliplr(h)).', p.name);
+            if max(abs(conv(code, conj(fliplr(h_chip))))) > max(abs(conv(code, h_chip)))
+                warning('%s: mismatch taps look time-reversed. Check mismatch_form.', p.name);
             end
+            h = repelem(h_chip, spc);                           % spc taps per chip (6x code length at 2 samples/chip)
         case 'lfm'
             N  = round(p.lfm_T*fs);
             t  = ((0:N-1) - (N-1)/2) / fs;                       % time centred on the pulse
