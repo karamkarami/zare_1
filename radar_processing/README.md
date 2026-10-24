@@ -104,7 +104,33 @@ Earlier example output (Octave rendering; MATLAB draws the PPI on black):
   (`rsp_plot_summary`) and the scenario (`rsp_plot_scenario`: clutter map and antenna
   pattern).
 
-__MAINRESULTS__
+### Result of `main_ppi` (one revolution per entry, Octave run)
+
+| # | entry | targets found | false plots | Pfa per output cell (design) | mountain / forest Pfa |
+|---|---|---|---|---|---|
+| 1 | 600 MHz, PRF 1000, 3-pulse, FFT 16 | 6 / 7 | 105 | 3.0e-3 (1.6e-5) | 1.4e-1 / 7.1e-3 |
+| 2 | 2-pulse canceler | 6 / 7 | 326 | 1.2e-2 (1.6e-5) | 1.6e-1 / 1.1e-1 |
+| 3 | FFT 32 pulses, NCI 16 | 6 / 7 | 182 | 6.4e-3 (3.2e-5) | 2.1e-1 / 8.7e-2 |
+| 4 | PRF 1500 Hz, 1300 MHz | 5 / 7 | 66 | 2.5e-3 (1.6e-5) | 7.4e-2 / 1.0e-2 |
+| 5 | bins 3:15 (low Doppler off) | 6 / 7 | 0 | 3.3e-5 (1.3e-5) | 3.8e-5 / 0 |
+
+* Target 5 (behind the mountain) is never seen: the budget predicts −4 dB margin (−40 dB shadow).
+* Target 7 (150 m/s) is measured at −99.6 m/s (velocity folding at ±125 m/s). At PRF 1500 its
+  99.3 km lies just inside the 99.9 km unambiguous range: its 100 µs echo is cut by the next
+  transmission (eclipsing), so it is not tested by the CFAR.
+* Clutter residue piles up in the bins next to zero Doppler, where the noise is low (the
+  canceler suppresses it there), so mountain and forest give false alarms. A 2-pulse canceler
+  makes it worse (ground too), and leaving bins 1, 2 and 16 out removes them. The price: target 1
+  (20 m/s, bin 2) loses 10 dB of margin and is measured 3.4 m/s off.
+* Errors of the detected targets: ≤ 0.02° in azimuth, ≤ 1 m in range, ≤ 0.4 m/s in velocity.
+
+| Scenario (clutter map, antenna pattern) | PPI at the end of the schedule |
+|---|---|
+| ![Scenario](docs/main_ppi_scenario.png) | ![PPI](docs/main_ppi_ppi.png) |
+
+| Scan 1: all bins (false plots over mountain and forest) | Scan 5: low Doppler bins off |
+|---|---|
+| ![Scan 1](docs/main_ppi_summary_1.png) | ![Scan 5](docs/main_ppi_summary_5.png) |
 
 ## Pulses and decoders
 
