@@ -17,9 +17,14 @@ P.radar.fcMHz      = 600;           % carrier [MHz]; sets m/s <-> Doppler:
                                     % (600 MHz: +-125 m/s; 1300 MHz: +-58 m/s)
 P.radar.azStartDeg = 0;             % azimuth of the first pulse [deg]
 
+P.antenna.type         = 'model';   % 'model' | 'sinc' | 'gaussian' | 'table'
 P.antenna.beamwidthDeg = 4;         % 3 dB azimuth beamwidth [deg]
 P.antenna.sidelobeDb   = -25;       % sidelobes, one way [dB]
 P.antenna.backlobeDb   = -40;       % back lobe, one way [dB]
+% Your own pattern from a file (two columns: angle [deg], one-way gain [dB]);
+% the beamwidth is then measured from the file:
+%   P.antenna = rsp_antenna_load(P.antenna, fullfile(fileparts(mfilename('fullpath')), ...
+%                                'patterns', 'example_pattern.csv'));
 
 %% Sampling -----------------------------------------------------------------------------
 P.fs = 6;                           % [MHz] -> 25 m range cells

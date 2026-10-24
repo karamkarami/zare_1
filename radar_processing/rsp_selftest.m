@@ -18,6 +18,18 @@ function ok = rsp_selftest()
 %                         azimuth and velocity, CFAR margin as budgeted; Pfa
 %                         on noise; block size independence
 %   9. rsp_compare      : finds a known shift and gain
+%  10. antenna patterns : sinc, a pattern loaded from a .csv / .mat file
+%                         (beamwidth measured, values interpolated)
+%  11. terrain clutter  : power and spectral spread of a forest layer, mountain
+%                         shadow on clutter and on targets, region map
+%  12. range ambiguity  : echo beyond c/2PRF at its folded range with the true phase
+%  13. canceler / FFT / carrier / PRF : 2- and 4-pulse taps, 32-pulse FFT; a target
+%                         through the whole chain with a 2-pulse canceler, with a
+%                         32-pulse FFT and at PRF 1500 / 1300 MHz (velocity folding)
+%                         found where expected, margins as budgeted
+%  14. scan schedule    : timeline continuity (time, azimuth, gap), parameter
+%                         paths, false alarm accounting per region
+%  15. saving           : results.mat and CSV files read back unchanged
 
 rng(7);
 ok = true;
@@ -245,6 +257,176 @@ ok = check(ok, sprintf('compare: shift [%d %d], gain %.2f dB', r.lag, r.gainDb),
            isequal(r.lag, [2 5]) && abs(r.gainDb - 20*log10(2)) < 0.01 && r.corr > 0.999);
 r = rsp_compare(out.cfar.map, out.cfar.det, 'cfar', 'quiet', true, 'align', false);
 ok = check(ok, 'compare: identical detection maps', r.missed == 0 && r.extra == 0);
+
+%% 10. Antenna patterns ---------------------------------------------------------------
+A = P.antenna;  A.type = 'sinc';
+G = 10*log10(rsp_antenna_pattern([0 A.beamwidthDeg/2 -A.beamwidthDeg/2], A));
+th = (1.2:0.001:2.2) * A.beamwidthDeg;                            % first sidelobe region
+sl = max(10*log10(rsp_antenna_pattern(th, A)));
+ok = check(ok, sprintf('antenna sinc: 3 dB at +-bw/2, first sidelobe %.2f dB (-13.26)', sl), ...
+           abs(G(2) + 3.01) < 0.02 && abs(G(3) + 3.01) < 0.02 && abs(sl + 13.26) < 0.02);
+here = fileparts(mfilename('fullpath'));
+A  = rsp_antenna_load(P.antenna, fullfile(here, 'patterns', 'example_pattern.csv'));
+raw = dlmread(fullfile(here, 'patterns', 'example_pattern.csv'), ',', 1, 0);
+Gt = 10*log10(rsp_antenna_pattern(raw(:, 1), A));
+G3 = 10*log10(rsp_antenna_pattern(A.beamwidthDeg/2 * [-1 1], A));
+ok = check(ok, sprintf(['antenna file: %d points, values reproduced, measured beamwidth %.2f deg ' ...
+           '(3 dB edges %.2f / %.2f dB)'], size(raw, 1), A.beamwidthDeg, G3), ...
+           strcmp(A.type, 'table') && max(abs(Gt - (raw(:, 2) - max(raw(:, 2))))) < 1e-9 && ...
+           abs(A.beamwidthDeg - 4.02) < 0.05 && all(abs(G3 + 3) < 0.05));
+tmp = [tempname() '.mat'];
+angleDeg = 0:0.5:180;  gainDb = -12 * (angleDeg / 4).^2;  gainDb = max(gainDb, -45); %#ok<NASGU>
+save(tmp, 'angleDeg', 'gainDb');
+A = rsp_antenna_load(P.antenna, tmp);
+delete(tmp);
+ok = check(ok, sprintf('antenna .mat one-sided table: symmetric, beamwidth %.3f deg (4)', ...
+           A.beamwidthDeg), abs(A.beamwidthDeg - 4) < 0.01 && ...
+           abs(rsp_antenna_pattern(-3, A) - rsp_antenna_pattern(3, A)) < 1e-12);
+
+%% 11. Terrain clutter --------------------------------------------------------------------
+g  = rsp_geometry(P, 10);
+St = struct('nRange', 1200, 'noiseDb', -300, 'blankTx', false, 'seed', 5);
+St.targets = struct('rangeM', {}, 'azDeg', {}, 'velocityMps', {}, 'powerDb', {});
+St.clutter = struct('type', 'forest', 'azDeg', [0 360], 'rangeM', [0 60000], 'powerDb', 20, ...
+                    'textureDb', 0, 'edgeM', 0, 'dcFraction', 0.5, 'sigmaVMps', 0.6);
+v  = double(rsp_simulate(P, St, (1:2000)'));
+x  = v(:, 700:1150);
+pc = 10*log10(mean(abs(x(:)).^2));
+a  = x(2:end, :);  b = x(1:end-1, :);
+r1 = abs(sum(a(:) .* conj(b(:)))) / sqrt(sum(abs(a(:)).^2) * sum(abs(b(:)).^2));
+sv = sqrt(2*(1 - r1)) / (2*pi) * g.lambdaM * P.radar.prfHz / 2;   % spectral std [m/s]
+vs = 0.265 * g.degPerPulse / P.antenna.beamwidthDeg * g.lambdaM * P.radar.prfHz / 2;
+ve = sqrt(0.5 * 0.6^2 + vs^2);
+ok = check(ok, sprintf(['clutter forest: power %.2f dB (20), spectral spread %.3f m/s ' ...
+           '(%.3f: half static, half 0.6 m/s wind, + %.2f m/s scanning)'], pc, sv, ve, vs), ...
+           abs(pc - 20) < 0.5 && abs(sv - ve) < 0.1 * ve);
+% mountain shadow on the ground clutter behind it
+St.clutter = struct('type', {'ground', 'mountain'}, 'azDeg', {[0 360], [100 140]}, ...
+                    'rangeM', {[0 60000], [15000 20000]}, 'powerDb', {20, 20}, ...
+                    'textureDb', {0, 0}, 'edgeM', {0, 0});
+St.nRange = 2000;
+pw = zeros(1, 2);
+Q  = P;
+for i = 1:2
+    Q.radar.azStartDeg = 120 + 180 * (i - 1);                  % mountain / open side
+    v = double(rsp_simulate(Q, St, (1:100)'));
+    x = v(:, 1600:1990);                                        % 40 .. 50 km: the video spans
+                                                                % the 17 km transmission
+    pw(i) = 10*log10(mean(abs(x(:)).^2));
+end
+ok = check(ok, sprintf('clutter: shadow behind the mountain %.1f dB (open side %.1f dB)', ...
+           pw(1) - pw(2), pw(2)), pw(1) - pw(2) < -35 && abs(pw(2) - 20) < 0.5);
+% shadow on a target, truth and region map
+St.clutter(2).powerDb = -300;                                    % shadow only
+St.targets = struct('rangeM', 30000, 'azDeg', 120, 'velocityMps', 0, 'powerDb', 0);
+St.noiseDb = -300;  St.clutter(1).powerDb = -300;
+Q.radar.azStartDeg = 120;
+v1 = max(abs(double(rsp_simulate(Q, St, 1))));
+tr = rsp_truth(Q, St);
+St.clutter = [];
+v0 = max(abs(double(rsp_simulate(Q, St, 1))));
+L  = rsp_clutter_types(struct('type', {'ground', 'mountain', 'forest'}));
+[id, nm] = rsp_clutter_region(L, [10 120 120 225 120], [5000 47000 70000 20000 30000]);
+ok = check(ok, sprintf(['clutter: target behind the mountain %.1f dB (truth %.1f dB); ' ...
+           'regions %s / %s / %s / %s / %s'], 20*log10(v1/v0), tr.shadowDb, nm{id + 1}), ...
+           abs(20*log10(v1/v0) + 40) < 0.1 && abs(tr.shadowDb + 40) < 0.01 && ...
+           isequal(id, [1 2 4 3 0]));
+
+%% 12. Range ambiguity: echo of an earlier pulse ---------------------------------------
+Q  = P;  Q.radar.prfHz = 2000;  Q.antenna.type = 'model';
+g  = rsp_geometry(Q, 10);
+cell0 = 1500;
+Rt = g.rangeUnambM + (cell0 - 1) * g.cellM;                     % beyond c/2PRF = 75 km
+St = struct('nRange', 2900, 'noiseDb', -300, 'blankTx', false, 'seed', 1, 'clutter', []);
+St.targets = struct('rangeM', Rt, 'azDeg', 0, 'velocityMps', 0, 'powerDb', 10);
+v  = double(rsp_simulate(Q, St, 1));
+tx = pointEchoes(Q, 1, 1, 2900);
+ref = circshift(double(tx), [0 cell0 - 1]) * sqrt(10) * exp(-1j*2*pi*Q.radar.fcMHz*2*Rt/c0*1e6);
+tr = rsp_truth(Q, St);
+ok = check(ok, sprintf(['range ambiguity: target at %.1f km (beyond %.1f km) appears at ' ...
+           '%.1f km with the true carrier phase'], Rt/1e3, g.rangeUnambM/1e3, ...
+           tr.apparentRangeM/1e3), relErr(ref, v) < 1e-6 && tr.ambiguous && tr.cell == cell0);
+
+%% 13. Canceler order, FFT length, carrier and PRF through the whole chain ------------------
+C = P.canceler;  C.order = 2;
+X = complex(randn(30, 8), randn(30, 8));
+[Y, ~, w] = rsp_canceler(X, C);
+ok = check(ok, 'canceler: 2-pulse taps [1 -1], equals x(m) - x(m-1)', isequal(w, [1 -1]) && ...
+           relErr([zeros(1, 8); X(2:end, :) - X(1:end-1, :)], Y) < 1e-12);
+C.order = 4;
+ok = check(ok, 'canceler: 4-pulse taps [1 -3 3 -1]', isequal(rsp_canceler_taps(C), [1 -3 3 -1]));
+F = P.fft;  F.nPulses = 32;  F.nfft = 32;
+X = repmat(exp(1j*2*pi*(10-1)/32*(0:79)'), 1, 3);
+[D, idx] = rsp_doppler_fft(X, F);
+[~, b] = max(abs(squeeze(D(5, 2, :))));
+s5 = (5-1)*F.hop + (1:32);
+ok = check(ok, 'Doppler FFT 32 pulses: tone in bin 10, equals direct FFT', b == 10 && ...
+           relErr(fft(X(s5, :) .* rsp_window(F.window, 32), 32, 1).', squeeze(D(5, :, :))) < 1e-12 ...
+           && idx(5) == s5(end));
+St = struct('nRange', 3000, 'noiseDb', 0, 'blankTx', true, 'seed', 11, 'clutter', []);
+St.targets = struct('rangeM', 50000, 'azDeg', 6, 'velocityMps', 100, 'powerDb', 0);
+cfgs = {'2-pulse canceler', {'canceler.order', 2}; ...
+        'FFT 32 pulses, NCI 16', {'fft.nPulses', 32, 'fft.nfft', 32, 'nci.nFrames', 16}; ...
+        'PRF 1500 Hz, 1300 MHz', {'radar.prfHz', 1500, 'radar.fcMHz', 1300}};
+for k = 1:size(cfgs, 1)
+    sc = struct('name', cfgs{k, 1}, 'degrees', 12, 'set', cfgs(k, 2));
+    rn = rsp_schedule(P, St, sc, 'display', false, 'quiet', true);
+    s1 = rn.scans(1);
+    r  = s1.report;
+    gk = rsp_geometry(s1.P, 10);
+    if r.found
+        ok = check(ok, sprintf(['%s: target found, errors %.2f deg %.0f m %.1f m/s ' ...
+                   '(measures %.1f of 100 m/s, +-%.0f), margin %.1f dB (budget %.1f)'], ...
+                   cfgs{k, 1}, r.dAzDeg, r.dRangeM, r.dVelMps, r.plotVelocityMps, ...
+                   gk.vUnambMps/2, r.marginDb, s1.budget.marginDb), abs(r.dAzDeg) < 0.2 && ...
+                   abs(r.dRangeM) < 25 && abs(r.dVelMps) < 3 && ...
+                   abs(r.marginDb - s1.budget.marginDb) < 4);
+    else
+        ok = check(ok, sprintf('%s: target found', cfgs{k, 1}), false);
+    end
+end
+ok = check(ok, sprintf('carrier / PRF: 100 m/s at 1300 MHz, PRF 1500 folds to %.1f m/s', ...
+           s1.truth.foldedMps), abs(s1.truth.foldedMps - (100 - 2*86.48)) < 0.1);
+
+%% 14. Scan schedule -----------------------------------------------------------------------
+St = struct('nRange', 3000, 'noiseDb', 0, 'blankTx', true, 'seed', 21);
+St.targets = struct('rangeM', {}, 'azDeg', {}, 'velocityMps', {}, 'powerDb', {});
+St.clutter = struct('type', 'forest', 'azDeg', [0 30], 'rangeM', [10000 40000], 'powerDb', 20);
+sc = struct('name', {'a', 'b'}, 'degrees', {5, 5}, 'gapS', {0, 10}, ...
+            'set', {{'radar.prfHz', 1200}, {'pulse(1).fcMHz', -1, 'canceler.order', 2}});
+rn = rsp_schedule(P, St, sc, 'display', false, 'quiet', true);
+tl = rn.timeline;
+s2 = rn.scans(2);
+ok = check(ok, sprintf(['schedule: entry 2 starts at %.3f s = end %.3f s + gap 10 s, ' ...
+           'az %.2f deg = %.2f + one idle turn'], tl.startS(2), tl.endS(1), tl.startAzDeg(2), ...
+           tl.endAzDeg(1)), abs(tl.startS(2) - tl.endS(1) - 10) < 1e-9 && ...
+           abs(mod(tl.startAzDeg(2) - tl.endAzDeg(1) + 180, 360) - 180) < 1e-9 && ...
+           tl.prfHz(1) == 1200 && tl.prfHz(2) == P.radar.prfHz && ...
+           s2.P.pulse(1).fcMHz == -1 && tl.canceler(2) == 2 && tl.canceler(1) == 3 && ...
+           abs(s2.P.radar.startTimeS - tl.startS(2)) < 1e-12);
+fa = s2.falseAlarms;
+nTested = numel(s2.azDeg) * (diff(s2.validCells) + 1);
+ok = check(ok, sprintf(['false alarms: %d cells counted in regions %s (= %d tested), ' ...
+           'totals consistent'], fa.cells(end), strjoin(fa.names(fa.cells > 0), '/'), nTested), ...
+           fa.cells(end) == nTested && fa.falseDet(end) == nnz(fa.isFalse) && ...
+           fa.falseDet(end) == sum(fa.falseDet(1:end-1)) && fa.cells(2) > 0);
+
+%% 15. Saving ------------------------------------------------------------------------------
+dirOut = tempname();
+files = evalc('rsp_save(rn, dirOut, ''figures'', false);');     %#ok<NASGU>
+sv = load(fullfile(dirOut, 'results.mat'));
+pl = dlmread(fullfile(dirOut, 'plots.csv'), ',', 1, 0);
+dt = dlmread(fullfile(dirOut, 'detections.csv'), ',', 1, 0);
+nPl = numel(rn.scans(1).plots.azDeg) + numel(rn.scans(2).plots.azDeg);
+nDt = numel(rn.scans(1).det.pulse) + numel(rn.scans(2).det.pulse);
+okSave = isequal(sv.result.timeline.startS, rn.timeline.startS) && ...
+         isequal(sv.result.scans(2).det.cell, rn.scans(2).det.cell) && ...
+         size(pl, 1) == nPl && size(dt, 1) == nDt && ...
+         (nDt == 0 || max(abs(dt(:, 5) - [rn.scans(1).det.rangeM; rn.scans(2).det.rangeM])) < 1e-3) && ...
+         exist(fullfile(dirOut, 'timeline.csv'), 'file') && exist(fullfile(dirOut, 'summary.txt'), 'file');
+ok = check(ok, sprintf('save: results.mat, %d plots and %d detections read back from CSV', ...
+           nPl, nDt), okSave);
+rmdir(dirOut, 's');
 
 if ok
     fprintf('ALL TESTS PASSED\n');

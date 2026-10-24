@@ -11,6 +11,7 @@ function g = rsp_geometry(P, nRange, pulses)
 %   g.rangeM       range of every cell [m] (cell 1 = P.radar.rangeOffsetM)
 %   g.lambdaM      wavelength [m]
 %   g.vUnambMps    unambiguous velocity span, lambda*PRF/2 [m/s]
+%   g.rangeUnambM  unambiguous range c/2PRF [m]
 %   g.binVelMps    radial velocity at the centre of each Doppler bin [m/s]
 %                  (positive = approaching), folded into +-vUnamb/2
 %   g.degPerPulse  antenna rotation between pulses [deg]
@@ -18,7 +19,8 @@ function g = rsp_geometry(P, nRange, pulses)
 %                  of the chain (plots are corrected by it)
 %   g.pulsesPerScan
 %   g.timeS, g.azDeg  time and antenna azimuth of each requested pulse
-%                     (azimuth 0 = north, clockwise)
+%                     (azimuth 0 = north, clockwise); the time starts at
+%                     P.radar.startTimeS (scan schedules)
 
 c   = 299792458;
 rad = P.radar;
@@ -26,6 +28,7 @@ g.cellM   = c / (2 * P.fs * 1e6);
 g.rangeM  = rad.rangeOffsetM + (0:nRange-1)' * g.cellM;
 g.lambdaM = c / (rad.fcMHz * 1e6);
 g.vUnambMps = g.lambdaM * rad.prfHz / 2;
+g.rangeUnambM = c / (2 * rad.prfHz);
 
 nfft = max(P.fft.nfft, P.fft.nPulses);
 k    = (0:nfft-1) - P.fft.shift * floor(nfft/2);       % frequency index per bin
@@ -40,7 +43,14 @@ g.outputDelayPulses = ((nTaps - 1) + (P.fft.nPulses - 1) + (P.nci.nFrames - 1) *
 g.pulsesPerScan = round(360 / g.degPerPulse);
 if nargin >= 3
     pulses  = pulses(:);
-    g.timeS = (pulses - 1) / rad.prfHz;
+    g.timeS = startTime(rad) + (pulses - 1) / rad.prfHz;
     g.azDeg = mod(rad.azStartDeg + g.degPerPulse * (pulses - 1), 360);
+end
+end
+
+function t = startTime(rad)
+t = 0;
+if isfield(rad, 'startTimeS') && ~isempty(rad.startTimeS)
+    t = rad.startTimeS;
 end
 end

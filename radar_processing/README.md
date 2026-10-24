@@ -20,7 +20,13 @@ returned so it can be compared with the matching MCPS log lane (`decoder`, `canc
    margin of every target over the CFAR threshold). It then simulates two revolutions while
    the PPI sweep turns at the antenna speed. Finally it prints every target echo against its
    plot and replays the revolutions in real time.
-4. **Self-test:** run `rsp_selftest` (45 checks).
+4. **Terrain, schedule, false alarms:** run `main_ppi`. Noise, ground / mountain / forest
+   clutter, terrain shadow and seven targets. A schedule of five scans, each with its own
+   carrier, PRF, canceler (2 / 3 pulses), FFT length or output bins, runs on one live PPI.
+   For every scan it prints the targets against their plots and the false alarms of each
+   clutter region against the design Pfa. Results are saved in `results/run_<date>/`.
+   Persian guide: [README_FA.md](README_FA.md).
+5. **Self-test:** run `rsp_selftest` (62 checks).
 
 ### Test scenario (`main_scan`)
 
@@ -59,6 +65,47 @@ Earlier example output (Octave rendering; MATLAB draws the PPI on black):
 |---|---|
 | ![PPI](docs/ppi_full_scan.png) | ![Blocks](docs/chain_blocks.png) |
 
+## Terrain clutter, scan schedule and saved results (`main_ppi`)
+
+* **Clutter layers (`S.clutter`, `rsp_clutter_types`):** a struct array, one layer per
+  region. Each layer is `'ground'`, `'mountain'` or `'forest'`, with an azimuth sector, a
+  range extent and soft edges. Every field has a default for its type:
+
+  | type | power | internal motion | static share | texture | other |
+  |---|---|---|---|---|---|
+  | ground | 10 dB | 0.1 m/s | 0.9 | 3 dB | |
+  | mountain | 45 dB (at the ridge) | 0.05 m/s | 0.98 | 6 dB | +10 dB slope towards the ridge, shadow −40 dB behind it |
+  | forest | 20 dB | 0.6 m/s (wind) | 0.5 | 4 dB | |
+
+  Each layer is a static part plus a moving part. Both are spread by the antenna scanning
+  (0.265·PRF / pulses per beamwidth, 0.6 m/s here). The mean power map is smoothed by the
+  two-way beam in azimuth. A mountain hides the clutter and the targets behind it.
+  The earlier single struct (`powerDb`, `maxRangeM`, ...) still works as one ground layer.
+* **Range ambiguity:** an echo from beyond c/2PRF arrives from an earlier pulse, at
+  its delay mod PRI. `rsp_truth` gives the apparent range. `rsp_scan` cuts the record to one
+  PRI when the PRF is raised.
+* **Antenna pattern:** `P.antenna.type` is `'model'`, `'sinc'`, `'gaussian'` or `'table'`.
+  `rsp_antenna_load(P.antenna, file)` reads a `.csv` / `.txt` file (angle [deg], one-way gain
+  [dB]) or a `.mat` file (`angleDeg`, `gainDb`). It measures the 3 dB beamwidth from the
+  table. `patterns/example_pattern.csv` is a 32-element Taylor array (4.0°, −30 dB).
+* **False alarms (`rsp_false_alarms`):** detections away from every target crossing are
+  counted per clutter region (clear, each layer, shadow). Plots that match no target are
+  counted the same way. Both are compared with the design value
+  1 − (1 − Pfa)^nBins per output cell. `rsp_scan` prints the table after every scan.
+* **Scan schedule (`rsp_schedule`):** each entry gives a name, `turns` (or `degrees`), an
+  optional idle `gapS` and its changes (`{'radar.prfHz', 1500, 'canceler.order', 2, ...}`
+  or a function). Time and azimuth continue from one entry to the next, so the targets
+  keep moving. `run.timeline` lists start and end time, azimuth, PRF, carrier,
+  unambiguous range and velocity, the processing settings, and the targets found and
+  false plots of every entry.
+* **Saving (`rsp_save`):** `results.mat` holds everything. CSV files hold the plots,
+  detections, the target report, the link budget, the false alarms and the timeline.
+  `summary.txt` holds the printed tables. PNG files hold the PPI, a summary of every scan
+  (`rsp_plot_summary`) and the scenario (`rsp_plot_scenario`: clutter map and antenna
+  pattern).
+
+__MAINRESULTS__
+
 ## Pulses and decoders
 
 Each pulse is either `type = 'code'` or `type = 'lfm'`. The bandwidth `bwMHz = 1` gives
@@ -95,7 +142,9 @@ pulse. The CFAR runs only on cells whose echo is received in full (`P.cfar.valid
   and `powerDb`. The echo is the transmitted signal (both pulses) at a fractional delay
   2R(t)/c with carrier phase −2π f₀ τ, so Doppler, its sign and range walk come from the
   geometry. Its amplitude follows the two-way antenna pattern as the antenna turns.
-  Clutter is ground clutter at all azimuths, with a Gaussian spectrum and log-normal texture.
+  Clutter is a set of layers (ground, mountain, forest; see `main_ppi` above). Each layer has a
+  bell-shaped spectrum (4-pole slow-time filter with the requested standard deviation) and a
+  log-normal texture.
   Its mean power equals `powerDb`.
 * **Simulator check:** `rsp_selftest` compares the simulator with an independent computation.
   The echo matches the delayed transmission × carrier phase × amplitude exactly. The
@@ -191,6 +240,12 @@ lanes it reports matched, missed and extra detections.
 | `rsp_scan.m` | block-by-block scan processing (output independent of block size) |
 | `rsp_ppi_init.m`, `rsp_ppi_update.m`, `rsp_ppi_replay.m` | PPI display |
 | `rsp_plot.m`, `rsp_compare.m`, `rsp_db_limits.m` | figures and comparison |
+| `main_ppi.m` | terrain scenario, scan schedule, false alarms, saved results |
+| `rsp_clutter_types.m`, `rsp_clutter_mask.m`, `rsp_clutter_shadow.m`, `rsp_clutter_region.m`, `rsp_clutter_outline.m` | clutter layers (ground / mountain / forest), shadow, region map |
+| `rsp_antenna_load.m`, `patterns/` | antenna pattern from a table or file |
+| `rsp_schedule.m`, `rsp_schedule_print.m` | scan schedule and its timeline |
+| `rsp_false_alarms.m` | false detections and plots per clutter region, against the design Pfa |
+| `rsp_save.m`, `rsp_plot_summary.m`, `rsp_plot_scenario.m` | saved results and figures |
 | `rsp_selftest.m` | tests |
 
 ## Notes

@@ -22,8 +22,19 @@ P.radar.fcMHz        = 600;         % carrier frequency [MHz] (UHF, lambda = 0.5
                                     % unambiguous velocity +-lambda*PRF/4 = +-125 m/s
 P.radar.azStartDeg   = 0;           % antenna azimuth of pulse 1 [deg], 0 = north
 P.radar.rangeOffsetM = 0;           % range of cell 1 [m]
+P.radar.startTimeS   = 0;           % time of pulse 1 [s] (rsp_schedule sets it so
+                                    % that the scans of a schedule follow each other)
 
 %% ------------------------------------------------------------------ Antenna (azimuth only)
+P.antenna.type         = 'model';   % 'model'    : Gaussian main lobe + sidelobe envelope
+                                    % 'sinc'     : uniform aperture (-13 dB sidelobes)
+                                    % 'gaussian' : main lobe only
+                                    % 'table'    : your pattern (patternDeg / patternDb)
+P.antenna.file         = '';        % pattern file (.csv: angle [deg], gain [dB]; .mat:
+                                    % angleDeg, gainDb); read by rsp_antenna_load, which
+                                    % sets type 'table' and measures beamwidthDeg
+P.antenna.patternDeg   = [];        % 'table': angle from the beam axis [deg]
+P.antenna.patternDb    = [];        % 'table': one-way power gain [dB]
 P.antenna.beamwidthDeg = 4;         % 3 dB beamwidth [deg]
 P.antenna.sidelobeDb   = -25;       % first sidelobe, one way [dB]
 P.antenna.backlobeDb   = -40;       % back lobe, one way [dB]

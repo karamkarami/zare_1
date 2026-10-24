@@ -37,6 +37,10 @@ nPul  = numel(scan.azDeg);
 step  = max(1, round(opt.stepDeg / g.degPerPulse));
 lag   = ceil(1.5 * P.antenna.beamwidthDeg / g.degPerPulse);
 
+t0S = 0;                                                % schedule: time of pulse 1
+if isfield(P.radar, 'startTimeS') && ~isempty(P.radar.startTimeS)
+    t0S = P.radar.startTimeS;
+end
 det = scan.det;
 if ~isempty(opt.bins)                                   % keep only the chosen bins
     keep = ismember(det.bin, opt.bins);
@@ -67,7 +71,7 @@ for loop = 1:opt.loops
         sel  = showAt >= p(1) & showAt <= p(end) | (p(end) == nPul & showAt > nPul);
         h = rsp_ppi_update(h, scan.azDeg(p), rows, subset(plots, sel), ...
             sprintf('Az %5.1f deg   t = %5.1f s   scan %d   bins %s', scan.azDeg(p(end)), ...
-                    (p(end) - 1) / P.radar.prfHz, floor((p(end) - 1) * g.degPerPulse / 360) + 1, ...
+                    t0S + (p(end) - 1) / P.radar.prfHz, floor((p(end) - 1) * g.degPerPulse / 360) + 1, ...
                     binText(opt.bins, P.output.bins)));
         nUpd = nUpd + 1;
         if ~isempty(opt.framesDir) && mod(nUpd - 1, opt.frameEvery) == 0

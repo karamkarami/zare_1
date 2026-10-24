@@ -12,6 +12,9 @@ function scan = rsp_scan(P, S, varargin)
 %                        are processed (P.ppi.stepDeg steps, at P.ppi.speed
 %                        times the real antenna speed when processing keeps up)
 %     'quiet'    false   no printing
+%     'ppi'      []      an existing PPI (rsp_ppi_init / scan.ppi) to keep
+%                        painting on, e.g. the next scan of a schedule
+%     'label'    ''      text shown in the PPI title (e.g. the schedule entry)
 %
 %   Output
 %     scan.det     every output detection (after the max stage): pulse, cell,
@@ -19,6 +22,10 @@ function scan = rsp_scan(P, S, varargin)
 %     scan.plots   extracted plots (rsp_extract_plots), one per target echo
 %     scan.truth   where each target should appear, every revolution
 %     scan.report  truth against plots: found, errors, CFAR margin
+%     scan.falseAlarms  false detections / plots per clutter region, measured
+%                  against the design Pfa (rsp_false_alarms)
+%     scan.clutter clutter layers (rsp_clutter_types)
+%     scan.validCells  range cells tested by the CFAR
 %     scan.budget  expected margins (rsp_budget)
 %     scan.maxValue, scan.maxMargin   output stage as sparse pulses x range
 %                  matrices (for rsp_ppi_replay)
@@ -29,10 +36,25 @@ function scan = rsp_scan(P, S, varargin)
 %   pulses. Each block is preceded by the last pulses of the previous one
 %   (canceler + FFT + integration memory), so the output is identical to
 %   processing the whole scan at once, with bounded memory.
+%   The receiver listens one PRI at most: S.nRange is cut to PRI*fs cells
+%   when the PRF is raised. P.radar.startTimeS / azStartDeg place the scan
+%   in a schedule (rsp_schedule).
 
-opt = struct('degrees', 360, 'display', true, 'quiet', false);
+opt = struct('degrees', 360, 'display', true, 'quiet', false, 'ppi', [], 'label', '');
 for i = 1:2:numel(varargin)
     opt.(varargin{i}) = varargin{i+1};
+end
+P.antenna = rsp_antenna_load(P.antenna);                       % pattern from a file
+rMax = floor(1e6 / P.radar.prfHz * P.fs);                      % one PRI of listening
+if S.nRange > rMax
+    if ~opt.quiet
+        fprintf('PRF %g Hz: record cut to %d range cells (%.1f km, one PRI)\n', ...
+                P.radar.prfHz, rMax, rMax * 299792458 / (2e6 * P.fs) / 1e3);
+    end
+    S.nRange = rMax;
+end
+if ~isfield(P.radar, 'startTimeS') || isempty(P.radar.startTimeS)
+    P.radar.startTimeS = 0;
 end
 R = S.nRange;
 g = rsp_geometry(P, R);
@@ -57,7 +79,11 @@ lastEmit = 0;
 
 scan.budget = rsp_budget(P, S, opt.quiet);
 if opt.display
-    ppi = rsp_ppi_init(P, g.rangeM, 'PPI');
+    if isempty(opt.ppi)
+        ppi = rsp_ppi_init(P, g.rangeM, 'PPI');
+    else
+        ppi = opt.ppi;
+    end
 end
 if ~opt.quiet
     fprintf('Scan: %d pulses (%.0f deg, %d revolution(s)), %d per block, %.3f deg per pulse\n', ...
@@ -79,6 +105,7 @@ while next <= nTotal
     vIdx  = [histIdx; pulses];
     o     = rsp_chain(v, P, cache);
     cache = o.cache;
+    validCells = o.mf.validCells;
 
     % output rows of this block's new pulses
     pr  = vIdx(o.idx.max);
@@ -128,12 +155,12 @@ while next <= nTotal
             k  = (s0:min(s0 + stepP - 1, numel(pr)))';
             sp = pl.pulse + lag <= pr(k(end)) | (k(end) == numel(pr));
             ppi = rsp_ppi_update(ppi, gp.azDeg(k), rows(k, :), subset(pl, sp), ...
-                  sprintf('Az %5.1f deg   t = %5.1f s   scan %d   %s   bins %s', ...
-                          gp.azDeg(k(end)), gp.timeS(k(end)), ...
+                  sprintf('%sAz %5.1f deg   t = %5.1f s   scan %d   %s   bins %s', ...
+                          opt.label, gp.azDeg(k(end)), gp.timeS(k(end)), ...
                           floor((pr(k(end)) - 1) * g.degPerPulse / 360) + 1, ...
                           upper(P.ppi.source), binText(P.output.bins)));
             pl  = subset(pl, ~sp);
-            wait = gp.timeS(k(end)) / P.ppi.speed - toc(t0);
+            wait = (gp.timeS(k(end)) - P.radar.startTimeS) / P.ppi.speed - toc(t0);
             if isfinite(P.ppi.speed) && wait > 0
                 pause(wait);
             end
@@ -165,6 +192,11 @@ scan.truth  = tr([tr.pulse] <= nTotal);
 scan.report = matchTruth(scan.truth, scan.plots, P, g);
 scan.P      = P;
 scan.S      = S;
+scan.clutter    = rsp_clutter_types([]);
+if isfield(S, 'clutter')
+    scan.clutter = rsp_clutter_types(S.clutter);
+end
+scan.validCells = validCells;
 scan.time   = toc(t0);
 if opt.display
     scan.ppi = ppi;
@@ -174,6 +206,7 @@ if ~opt.quiet
             numel(scan.plots.azDeg));
     printReport(scan.report, scan.plots, g);
 end
+scan.falseAlarms = rsp_false_alarms(scan, ~opt.quiet);
 end
 
 % ========================================================================================
@@ -198,20 +231,22 @@ function rep = matchTruth(truth, plots, P, g)
 rep = struct('target', {}, 'scan', {}, 'found', {}, 'azDeg', {}, 'rangeM', {}, ...
              'velocityMps', {}, 'plot', {}, 'plotAzDeg', {}, 'plotRangeM', {}, ...
              'plotVelocityMps', {}, 'dAzDeg', {}, 'dRangeM', {}, 'dVelMps', {}, ...
-             'hits', {}, 'marginDb', {});
+             'hits', {}, 'marginDb', {}, 'ambiguous', {}, 'shadowDb', {});
 used = false(size(plots.azDeg));
 for k = 1:numel(truth)
     t  = truth(k);
     da = mod(plots.azDeg - t.azDeg + 180, 360) - 180;
-    dr = plots.rangeM - t.rangeM;
+    dr = plots.rangeM - t.apparentRangeM;
     dp = abs(plots.pulse - t.pulse);                             % same revolution
     ok = abs(da) < 2*P.antenna.beamwidthDeg & abs(dr) < 500 & dp < 90 / g.degPerPulse & ~used;
     rep(k).target      = t.target;
     rep(k).scan        = t.scan;
     rep(k).found       = any(ok);
     rep(k).azDeg       = t.azDeg;
-    rep(k).rangeM      = t.rangeM;
+    rep(k).rangeM      = t.apparentRangeM;
     rep(k).velocityMps = t.velocityMps;
+    rep(k).ambiguous   = t.ambiguous;
+    rep(k).shadowDb    = t.shadowDb;
     if any(ok)
         cand = find(ok);
         [~, j] = min(abs(da(cand)) / P.antenna.beamwidthDeg + abs(dr(cand)) / 500);
@@ -236,13 +271,21 @@ fprintf(['\n  target scan |  az[deg]  range[m]  vel[m/s] |  plot az  plot range 
          ' dAz[deg]  dR[m]  dV[m/s] | hits  CFAR margin[dB]\n']);
 for k = 1:numel(rep)
     r = rep(k);
+    if r.ambiguous
+        fprintf('  (target %d: range beyond c/2PRF = %.1f km, appears at %.1f km)\n', ...
+                r.target, g.rangeUnambM/1e3, r.rangeM/1e3);
+    end
     if r.found
         fprintf('  %6d %4d | %8.2f %9.0f %9.1f | %8.2f %11.0f %9.1f | %8.2f %6.0f %8.1f | %4d %10.1f\n', ...
             r.target, r.scan, r.azDeg, r.rangeM, r.velocityMps, r.plotAzDeg, r.plotRangeM, ...
             r.plotVelocityMps, r.dAzDeg, r.dRangeM, r.dVelMps, r.hits, r.marginDb);
     else
-        fprintf('  %6d %4d | %8.2f %9.0f %9.1f |   NOT DETECTED\n', r.target, r.scan, ...
-            r.azDeg, r.rangeM, r.velocityMps);
+        why = '';
+        if r.shadowDb < -3
+            why = sprintf(' (behind terrain, %.0f dB)', r.shadowDb);
+        end
+        fprintf('  %6d %4d | %8.2f %9.0f %9.1f |   NOT DETECTED%s\n', r.target, r.scan, ...
+            r.azDeg, r.rangeM, r.velocityMps, why);
     end
 end
 nFalse = numel(plots.azDeg) - nnz([rep.found]);

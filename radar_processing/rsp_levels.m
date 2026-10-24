@@ -18,8 +18,12 @@ for k = 1:numel(S.targets)
         S.targets(k).powerDb = S.targets(k).snrDb + S.noiseDb;
     end
 end
-if isfield(S, 'clutter') && ~isempty(S.clutter) && ...
-        (~isfield(S.clutter, 'powerDb') || isempty(S.clutter.powerDb))
-    S.clutter.powerDb = S.clutter.cnrDb + S.noiseDb;
+if isfield(S, 'clutter') && isfield(S.clutter, 'cnrDb')
+    for k = 1:numel(S.clutter)
+        if (~isfield(S.clutter, 'powerDb') || isempty(S.clutter(k).powerDb)) && ...
+                ~isempty(S.clutter(k).cnrDb)
+            S.clutter(k).powerDb = S.clutter(k).cnrDb + S.noiseDb;
+        end
+    end
 end
 end
